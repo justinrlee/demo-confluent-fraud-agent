@@ -165,7 +165,16 @@ module "tbl_fraud_alerts" {
       `reasoning` STRING NOT NULL,
       `actions_taken` STRING NOT NULL,
       `flagged_transaction_ids` STRING NOT NULL,
-      `raw_response` STRING NOT NULL
+      `raw_response` STRING NOT NULL,
+      `profile_start` TIMESTAMP_LTZ(3),
+      `profile_end` TIMESTAMP_LTZ(3),
+      `enriched_profile_text` STRING,
+      `arima_window_start` TIMESTAMP_LTZ(3),
+      `arima_window_end` TIMESTAMP_LTZ(3),
+      `window_total` DOUBLE,
+      `expected_amount` DOUBLE,
+      `upper_bound` DOUBLE,
+      `lower_bound` DOUBLE
     );
   EOT
 }
@@ -174,7 +183,9 @@ module "tbl_fraud_alerts" {
 # Detects anomalous spending patterns by windowing transactions into 15-second
 # tumbling windows per user, aggregating spend metrics, and running ARIMA on
 # the aggregates. This pattern matches the Confluent reference architecture.
-module "tbl_anomalous_windows" {
+
+# Stage 1: Score ALL windows with ARIMA (includes is_anomaly boolean)
+module "tbl_arima_scored_windows" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -185,9 +196,9 @@ module "tbl_anomalous_windows" {
   flink_api_secret = local.flink_common.flink_api_secret
   catalog          = local.flink_common.catalog
   database         = local.flink_common.database
-  statement_name   = "create-table-anomalous-windows-${random_id.suffix.hex}"
+  statement_name   = "create-table-arima-scored-windows-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_windows` AS
+    CREATE TABLE `arima_scored_windows` AS
     WITH `windowed_spending` AS (
       SELECT
         `window_start`,
@@ -241,15 +252,13 @@ module "tbl_anomalous_windows" {
       `anomaly_result`.`upper_bound`,
       `anomaly_result`.`lower_bound`,
       `anomaly_result`.`is_anomaly`
-    FROM `anomaly_detection`
-    WHERE `anomaly_result`.`is_anomaly` = TRUE
-      AND `total_amount` > `anomaly_result`.`upper_bound`;
+    FROM `anomaly_detection`;
   EOT
   depends_on       = [module.tbl_transactions]
 }
 
-# Materialized view of transactions from anomalous windows (for dashboard/joins)
-module "tbl_anomalous_transactions" {
+# Stage 2: Filter to only anomalous windows (is_anomaly=true AND above threshold)
+module "tbl_anomalous_windows" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -260,30 +269,28 @@ module "tbl_anomalous_transactions" {
   flink_api_secret = local.flink_common.flink_api_secret
   catalog          = local.flink_common.catalog
   database         = local.flink_common.database
-  statement_name   = "create-table-anomalous-transactions-${random_id.suffix.hex}"
+  statement_name   = "create-table-anomalous-windows-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_transactions` AS
+    CREATE TABLE `anomalous_windows` AS
     SELECT
-      t.`user_id`,
-      t.`transaction_id`,
-      t.`amount`,
-      t.`merchant`,
-      t.`merchant_category`,
-      t.`location`,
-      t.`timestamp`,
-      t.`event_time`,
-      w.`total_amount` AS `window_total_amount`,
-      w.`expected_amount`,
-      w.`upper_bound`,
-      w.`lower_bound`
-    FROM `transactions` t
-    INNER JOIN `anomalous_windows` w
-      ON t.`user_id` = w.`user_id`
-      AND t.`event_time` >= w.`window_start`
-      AND t.`event_time` < w.`window_end`;
+      `user_id`,
+      `window_start`,
+      `window_end`,
+      `txn_count`,
+      `total_amount`,
+      `avg_amount`,
+      `max_amount`,
+      `expected_amount`,
+      `upper_bound`,
+      `lower_bound`,
+      `is_anomaly`
+    FROM `arima_scored_windows`
+    WHERE `is_anomaly` = TRUE
+      AND `total_amount` > `upper_bound`;
   EOT
-  depends_on       = [module.tbl_transactions, module.tbl_anomalous_windows]
+  depends_on       = [module.tbl_arima_scored_windows]
 }
+
 
 # ------------------------------- Model -------------------------------------
 module "model" {
@@ -526,6 +533,9 @@ module "agent" {
 # event-time SESSION window. Materialized as its own table/topic so it's
 # queryable (SELECT * FROM activity_profiles) and shows up as a node in Stream
 # Lineage between the source topics and the agent.
+#
+# NOTE: This processes ALL users (not pre-filtered). ARIMA filtering happens
+# later via join to anomalous_windows.
 module "profiles" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
@@ -549,40 +559,24 @@ module "profiles" {
   statement      = <<-EOT
     CREATE TABLE `activity_profiles` AS
     WITH `unified` AS (
-      SELECT a.`user_id`, 'transaction' AS `event_type`,
-             a.`event_time`,
-             CONCAT('- txn ', a.`transaction_id`, ': $', CAST(a.`amount` AS STRING),
-                    ' at ', a.`merchant`, ' (', a.`merchant_category`, ') in ', a.`location`,
-                    ' [WINDOW ANOMALY: total=$', CAST(a.`window_total_amount` AS STRING),
-                    ', expected=$', CAST(a.`expected_amount` AS STRING), ']') AS `line`
-      FROM `anomalous_transactions` a
+      SELECT `user_id`, 'transaction' AS `event_type`, `event_time`,
+             CONCAT('- txn ', `transaction_id`, ': $', CAST(`amount` AS STRING),
+                    ' at ', `merchant`, ' (', `merchant_category`, ') in ', `location`) AS `line`
+      FROM `transactions`
       UNION ALL
-      SELECT l.`user_id`, 'login' AS `event_type`,
-             l.`event_time`,
-             CONCAT('- login from ', l.`location`, ' via ', l.`device_id`, ' (ip ', l.`ip_address`, ')') AS `line`
-      FROM `user_logins` l
-      WHERE EXISTS (
-        SELECT 1 FROM `anomalous_transactions` a
-        WHERE a.`user_id` = l.`user_id`
-          AND ABS(TIMESTAMPDIFF(SECOND, l.`event_time`, a.`event_time`)) < 10
-      )
+      SELECT `user_id`, 'login' AS `event_type`, `event_time`,
+             CONCAT('- login from ', `location`, ' via ', `device_id`, ' (ip ', `ip_address`, ')') AS `line`
+      FROM `user_logins`
       UNION ALL
-      SELECT c.`user_id`, 'account_change' AS `event_type`,
-             c.`event_time`,
-             CONCAT('- ', c.`field_changed`, ' changed from "', c.`old_value`, '" to "', c.`new_value`, '"') AS `line`
-      FROM `account_changes` c
-      WHERE EXISTS (
-        SELECT 1 FROM `anomalous_transactions` a
-        WHERE a.`user_id` = c.`user_id`
-          AND ABS(TIMESTAMPDIFF(SECOND, c.`event_time`, a.`event_time`)) < 10
-      )
+      SELECT `user_id`, 'account_change' AS `event_type`, `event_time`,
+             CONCAT('- ', `field_changed`, ' changed from "', `old_value`, '" to "', `new_value`, '"') AS `line`
+      FROM `account_changes`
     )
     SELECT
       `user_id`,
       `window_start`,
       `window_end`,
       CONCAT(
-        'STATISTICAL ANOMALY DETECTED (ARIMA on 15s windowed spending)\n\n',
         'User: ', `user_id`, '\n\n',
         'Transactions:\n', COALESCE(LISTAGG(CASE WHEN `event_type` = 'transaction' THEN `line` END, '\n'), '  (none)'), '\n\n',
         'Logins:\n', COALESCE(LISTAGG(CASE WHEN `event_type` = 'login' THEN `line` END, '\n'), '  (none)'), '\n\n',
@@ -597,13 +591,99 @@ module "profiles" {
     module.tbl_transactions,
     module.tbl_user_logins,
     module.tbl_account_changes,
-    module.tbl_anomalous_transactions,
+  ]
+}
+
+# ------------------- Filter profiles to anomalous windows -----------------
+# Joins activity_profiles (all users, session-windowed) to anomalous_windows
+# (ARIMA-detected spending anomalies) to keep only profiles that overlap with
+# an anomalous window. This combines session-based burst detection with
+# statistical anomaly detection.
+module "anomalous_profiles" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "create-anomalous-profiles-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    CREATE TABLE `anomalous_profiles` AS
+    SELECT
+      p.`user_id`,
+      p.`window_start` AS `profile_start`,
+      p.`window_end` AS `profile_end`,
+      p.`profile_text`,
+      w.`window_start` AS `arima_window_start`,
+      w.`window_end` AS `arima_window_end`,
+      w.`total_amount` AS `window_total`,
+      w.`expected_amount`,
+      w.`upper_bound`,
+      w.`lower_bound`
+    FROM `activity_profiles` p
+    INNER JOIN `anomalous_windows` w
+      ON p.`user_id` = w.`user_id`
+      AND p.`window_start` < w.`window_end`
+      AND p.`window_end` > w.`window_start`;
+  EOT
+  depends_on = [
+    module.profiles,
+    module.tbl_anomalous_windows,
+  ]
+}
+
+# ----------------- Enrich profiles with ARIMA context ---------------------
+# Prepends ARIMA anomaly context (window stats, expected amounts, thresholds)
+# to the profile text so the agent sees both the statistical anomaly signal
+# and the detailed activity context.
+module "anomalous_profiles_enriched" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "create-enriched-profiles-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    CREATE TABLE `anomalous_profiles_enriched` AS
+    SELECT
+      `user_id`,
+      `profile_start`,
+      `profile_end`,
+      `arima_window_start`,
+      `arima_window_end`,
+      `window_total`,
+      `expected_amount`,
+      `upper_bound`,
+      `lower_bound`,
+      CONCAT(
+        'STATISTICAL ANOMALY DETECTED (ARIMA on 15s windowed spending)\n',
+        'Anomalous window: ', CAST(`arima_window_start` AS STRING), ' to ', CAST(`arima_window_end` AS STRING), '\n',
+        'Window total: $', CAST(`window_total` AS STRING),
+        ' (expected: $', CAST(`expected_amount` AS STRING),
+        ', threshold: $', CAST(`upper_bound` AS STRING), ')\n\n',
+        `profile_text`
+      ) AS `enriched_profile_text`
+    FROM `anomalous_profiles`;
+  EOT
+  depends_on = [
+    module.anomalous_profiles,
   ]
 }
 
 # ----------------------- Detection (agent) ---------------------------------
-# Reads each per-user activity profile, runs the Streaming Agent on it, and
-# parses the agent's JSON verdict into the fraud_alerts columns.
+# Reads each ARIMA-filtered, enriched activity profile, runs the Streaming
+# Agent on it, and parses the agent's JSON verdict into the fraud_alerts
+# columns. Only profiles that overlap with ARIMA-detected anomalies are
+# analyzed.
 module "detect" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
@@ -620,11 +700,20 @@ module "detect" {
     INSERT INTO `fraud_alerts`
     WITH `scored` AS (
       SELECT
-        `user_id`,
-        CAST(`response` AS STRING) AS `raw_response`,
-        REGEXP_EXTRACT(CAST(`response` AS STRING), '\{[\s\S]*\}', 0) AS `json_text`
-      FROM `activity_profiles`,
-      LATERAL TABLE(AI_RUN_AGENT(`fraud_detection_agent`, `profile_text`, `user_id`))
+        p.`user_id`,
+        p.`profile_start`,
+        p.`profile_end`,
+        p.`enriched_profile_text`,
+        p.`arima_window_start`,
+        p.`arima_window_end`,
+        p.`window_total`,
+        p.`expected_amount`,
+        p.`upper_bound`,
+        p.`lower_bound`,
+        CAST(r.`response` AS STRING) AS `raw_response`,
+        REGEXP_EXTRACT(CAST(r.`response` AS STRING), '\{[\s\S]*\}', 0) AS `json_text`
+      FROM `anomalous_profiles_enriched` p,
+      LATERAL TABLE(AI_RUN_AGENT(`fraud_detection_agent`, p.`enriched_profile_text`, p.`user_id`)) r
     )
     SELECT
       `user_id`,
@@ -632,12 +721,21 @@ module "detect" {
       COALESCE(JSON_VALUE(`json_text`, '$.reasoning'), '') AS `reasoning`,
       COALESCE(JSON_QUERY(`json_text`, '$.actions_taken'), '[]') AS `actions_taken`,
       COALESCE(JSON_QUERY(`json_text`, '$.flagged_transaction_ids'), '[]') AS `flagged_transaction_ids`,
-      `raw_response`
+      `raw_response`,
+      `profile_start`,
+      `profile_end`,
+      `enriched_profile_text`,
+      `arima_window_start`,
+      `arima_window_end`,
+      `window_total`,
+      `expected_amount`,
+      `upper_bound`,
+      `lower_bound`
     FROM `scored`;
   EOT
   depends_on = [
     module.agent,
-    module.profiles,
+    module.anomalous_profiles_enriched,
     module.tbl_fraud_alerts,
   ]
 }
