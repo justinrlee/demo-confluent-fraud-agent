@@ -24,7 +24,7 @@ SR_URL = os.environ["SCHEMA_REGISTRY_URL"]
 SR_API_KEY = os.environ["SCHEMA_REGISTRY_API_KEY"]
 SR_API_SECRET = os.environ["SCHEMA_REGISTRY_API_SECRET"]
 
-TOPICS = ["transactions", "user_logins", "account_changes", "fraud_alerts"]
+TOPICS = ["transactions", "user_logins", "account_changes", "fraud_alerts", "anomalous_transactions"]
 MAX_EVENTS = 500
 TIMESERIES_BUCKETS = 30
 BUCKET_SECONDS = 10
@@ -95,6 +95,7 @@ TOPIC_COLORS = {
     "user_logins": "#81c784",
     "account_changes": "#ffb74d",
     "fraud_alerts": "#ef5350",
+    "anomalous_transactions": "#ff6f00",
 }
 
 
@@ -151,6 +152,10 @@ def process_message(topic, value, batch):
         summary = f"{value.get('location', '?')} via {value.get('device_id', '?')}"
     elif topic == "account_changes":
         summary = f"{value.get('field_changed', '?')}: {value.get('old_value', '?')} → {value.get('new_value', '?')}"
+    elif topic == "anomalous_transactions":
+        window_total = value.get('window_total_amount', 0)
+        expected = value.get('expected_amount', 0)
+        summary = f"${value.get('amount', 0):.2f} at {value.get('merchant', '?')} [Window total=${window_total:.2f}, expected=${expected:.2f}]"
     elif topic == "fraud_alerts":
         value["actions_taken"] = _coerce_list(value.get("actions_taken"))
         value["flagged_transaction_ids"] = _coerce_list(value.get("flagged_transaction_ids"))
@@ -223,6 +228,7 @@ def kafka_polling_thread(state, lock):
                             "transactions": 0,
                             "user_logins": 0,
                             "account_changes": 0,
+                            "anomalous_transactions": 0,
                             "fraud_alerts": 0,
                         })
                     ts_buckets[0][topic] = ts_buckets[0].get(topic, 0) + 1
@@ -267,21 +273,26 @@ def render_metrics(state):
     txn = state["counters"].get("transactions", 0)
     login = state["counters"].get("user_logins", 0)
     changes = state["counters"].get("account_changes", 0)
+    anomalies = state["counters"].get("anomalous_transactions", 0)
     alerts = state["counters"].get("fraud_alerts", 0)
     unique = len(state["users"])
+
+    anomaly_rate = (anomalies / txn * 100) if txn > 0 else 0
 
     alerts_list = list(state["alerts"])
     risk_scores = [a.get("risk_score", 0) for a in alerts_list]
     high_risk = sum(1 for s in risk_scores if s >= 70)
     avg_risk = sum(risk_scores) / len(risk_scores) if risk_scores else 0
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
     c1.metric("Transactions", f"{txn:,}")
     c2.metric("Logins", f"{login:,}")
     c3.metric("Acct Changes", f"{changes:,}")
-    c4.metric("Fraud Alerts", f"{alerts:,}")
-    c5.metric("High Risk", high_risk)
-    c6.metric("Unique Users", unique)
+    c4.metric("ARIMA Anomalies", f"{anomalies:,}")
+    c5.metric("Anomaly Rate", f"{anomaly_rate:.1f}%")
+    c6.metric("Fraud Alerts", f"{alerts:,}")
+    c7.metric("High Risk", high_risk)
+    c8.metric("Unique Users", unique)
 
     return alerts_list, avg_risk
 
@@ -324,7 +335,7 @@ def render_charts(state):
                 )
                 .properties(height=300)
             )
-            st.altair_chart(chart.configure_view(stroke=None), use_container_width=True)
+            st.altair_chart(chart.configure_view(stroke=None), width='stretch')
         else:
             st.info("Waiting for events...")
 
@@ -360,7 +371,7 @@ def render_charts(state):
                 .mark_rule(color="#ef5350", strokeDash=[4, 4], opacity=0.5)
                 .encode(y="y:Q")
             )
-            st.altair_chart((points + rule).configure_view(stroke=None), use_container_width=True)
+            st.altair_chart((points + rule).configure_view(stroke=None), width='stretch')
         else:
             st.info("Waiting for fraud alerts...")
 
@@ -381,7 +392,7 @@ def render_charts(state):
             )
             .properties(height=max(len(df) * 45, 120))
         )
-        st.altair_chart(chart.configure_view(stroke=None), use_container_width=True)
+        st.altair_chart(chart.configure_view(stroke=None), width='stretch')
 
 
 def render_alerts_table(alerts_list):

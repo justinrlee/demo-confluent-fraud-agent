@@ -170,6 +170,121 @@ module "tbl_fraud_alerts" {
   EOT
 }
 
+# ----------------------- Anomaly Detection (ARIMA) ------------------------
+# Detects anomalous spending patterns by windowing transactions into 15-second
+# tumbling windows per user, aggregating spend metrics, and running ARIMA on
+# the aggregates. This pattern matches the Confluent reference architecture.
+module "tbl_anomalous_windows" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "create-table-anomalous-windows-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    CREATE TABLE `anomalous_windows` AS
+    WITH `windowed_spending` AS (
+      SELECT
+        `window_start`,
+        `window_end`,
+        `window_time`,
+        `user_id`,
+        COUNT(*) AS `txn_count`,
+        SUM(CAST(`amount` AS DOUBLE)) AS `total_amount`,
+        CAST(ROUND(AVG(CAST(`amount` AS DOUBLE)), 2) AS DOUBLE) AS `avg_amount`,
+        MAX(CAST(`amount` AS DOUBLE)) AS `max_amount`
+      FROM TABLE(
+        TUMBLE(TABLE `transactions`, DESCRIPTOR(`event_time`), INTERVAL '15' SECOND)
+      )
+      GROUP BY `window_start`, `window_end`, `window_time`, `user_id`
+    ),
+    `anomaly_detection` AS (
+      SELECT
+        `user_id`,
+        `window_start`,
+        `window_end`,
+        `window_time`,
+        `txn_count`,
+        `total_amount`,
+        `avg_amount`,
+        `max_amount`,
+        ML_DETECT_ANOMALIES(
+          `total_amount`,
+          `window_time`,
+          JSON_OBJECT(
+            'minTrainingSize' VALUE 8,
+            'maxTrainingSize' VALUE 100,
+            'confidencePercentage' VALUE 95.0,
+            'enableStl' VALUE FALSE
+          )
+        ) OVER (
+          PARTITION BY `user_id`
+          ORDER BY `window_time`
+          RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS `anomaly_result`
+      FROM `windowed_spending`
+    )
+    SELECT
+      `user_id`,
+      `window_start`,
+      `window_end`,
+      `txn_count`,
+      `total_amount`,
+      `avg_amount`,
+      `max_amount`,
+      CAST(ROUND(`anomaly_result`.`forecast_value`, 2) AS DOUBLE) AS `expected_amount`,
+      `anomaly_result`.`upper_bound`,
+      `anomaly_result`.`lower_bound`,
+      `anomaly_result`.`is_anomaly`
+    FROM `anomaly_detection`
+    WHERE `anomaly_result`.`is_anomaly` = TRUE
+      AND `total_amount` > `anomaly_result`.`upper_bound`;
+  EOT
+  depends_on       = [module.tbl_transactions]
+}
+
+# Materialized view of transactions from anomalous windows (for dashboard/joins)
+module "tbl_anomalous_transactions" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "create-table-anomalous-transactions-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    CREATE TABLE `anomalous_transactions` AS
+    SELECT
+      t.`user_id`,
+      t.`transaction_id`,
+      t.`amount`,
+      t.`merchant`,
+      t.`merchant_category`,
+      t.`location`,
+      t.`timestamp`,
+      t.`event_time`,
+      w.`total_amount` AS `window_total_amount`,
+      w.`expected_amount`,
+      w.`upper_bound`,
+      w.`lower_bound`
+    FROM `transactions` t
+    INNER JOIN `anomalous_windows` w
+      ON t.`user_id` = w.`user_id`
+      AND t.`event_time` >= w.`window_start`
+      AND t.`event_time` < w.`window_end`;
+  EOT
+  depends_on       = [module.tbl_transactions, module.tbl_anomalous_windows]
+}
+
 # ------------------------------- Model -------------------------------------
 module "model" {
   source           = "./modules/flink-statement"
@@ -344,25 +459,35 @@ module "agent" {
   statement        = <<-EOT
     CREATE AGENT `fraud_detection_agent`
     USING MODEL `fraud_model`
-    USING PROMPT 'You are a real-time fraud detection analyst.
+    USING PROMPT 'You are a real-time fraud detection analyst receiving activity profiles PRE-FILTERED by windowed ARIMA anomaly detection.
 
-    You receive a plain-text activity profile for ONE user over a short time window. It lists
-    the user id and that user''s recent transactions (each shown as "txn <transaction_id>: $<amount> at <merchant> ..."),
-    recent logins (location, device, ip), and recent account changes (field, old value, new value).
+    IMPORTANT: These profiles have already been flagged by a statistical ARIMA model that analyzes 15-second spending windows.
+    ARIMA detected that the user''s total spending in a 15-second window was anomalously high compared to their historical baseline.
+    Each transaction shows: [WINDOW ANOMALY: total=$X, expected=$Y] where total > expected indicates unusual spending velocity.
 
-    Analyze for these fraud signals:
+    Your job is CONTEXTUAL ANALYSIS. The ARIMA model only sees aggregate spending patterns — you see the full picture:
+    - Does the spending burst make sense given the user''s other activity?
+    - Are there supporting fraud signals beyond just the spending velocity?
+    - Is this likely a legitimate high-value shopping spree or actual fraud?
+
+    You receive a plain-text activity profile for ONE user over a short time window with:
+    - Transactions from an ARIMA-flagged 15-second window (with window total and expected amount)
+    - Recent logins (location, device, ip)
+    - Recent account changes (field, old value, new value)
+
+    Analyze for these fraud signals IN ADDITION TO the ARIMA spending anomaly:
     1. Geographic impossibility: login and transaction in distant cities within minutes
-    2. Velocity anomalies: many transactions in a short period
-    3. Account takeover: email/password change followed by a large purchase
-    4. Unusual amounts: transactions much larger than others
-    5. Device/IP anomalies: new devices combined with other signals
+    2. Account takeover: email/password change followed by rapid high-value purchases
+    3. Device/IP anomalies: new devices combined with other signals
+    4. Merchant patterns: unusual merchant types or rapid merchant switching
+    5. Contextual mismatch: ARIMA flagged it but the context suggests legitimate behavior (e.g. holiday shopping)
 
     SCORING GUIDE - use the FULL range:
-    - 90-100: Multiple strong signals combined (e.g. geo-impossible + account takeover + large amount)
-    - 70-89: One strong signal with supporting evidence (e.g. geo-impossible travel alone)
-    - 45-69: Suspicious patterns that need investigation (e.g. unusual amount or velocity alone)
-    - 20-44: Mildly unusual but likely legitimate (e.g. new device from same city)
-    - 0-19: Normal activity, no fraud signals detected
+    - 90-100: ARIMA spending anomaly + multiple strong fraud signals (e.g. geo-impossible + account takeover)
+    - 70-89: ARIMA spending anomaly + one strong fraud signal (e.g. geo-impossible travel or account takeover)
+    - 45-69: ARIMA spending anomaly with weak supporting signals (e.g. new device or unusual merchants)
+    - 20-44: ARIMA spending anomaly but context suggests legitimate (e.g. planned shopping from usual location)
+    - 0-19: ARIMA anomaly appears to be false positive (should be rare)
 
     TOOLS - DECIDE THE SCORE FIRST, THEN ACT. Determine risk_score before calling any tool, and
     only call the tools the score warrants below. Make every tool call up front. Once you call a
@@ -424,24 +549,40 @@ module "profiles" {
   statement      = <<-EOT
     CREATE TABLE `activity_profiles` AS
     WITH `unified` AS (
-      SELECT `user_id`, 'transaction' AS `event_type`, `event_time`,
-             CONCAT('- txn ', `transaction_id`, ': $', CAST(`amount` AS STRING),
-                    ' at ', `merchant`, ' (', `merchant_category`, ') in ', `location`) AS `line`
-      FROM `transactions`
+      SELECT a.`user_id`, 'transaction' AS `event_type`,
+             a.`event_time`,
+             CONCAT('- txn ', a.`transaction_id`, ': $', CAST(a.`amount` AS STRING),
+                    ' at ', a.`merchant`, ' (', a.`merchant_category`, ') in ', a.`location`,
+                    ' [WINDOW ANOMALY: total=$', CAST(a.`window_total_amount` AS STRING),
+                    ', expected=$', CAST(a.`expected_amount` AS STRING), ']') AS `line`
+      FROM `anomalous_transactions` a
       UNION ALL
-      SELECT `user_id`, 'login' AS `event_type`, `event_time`,
-             CONCAT('- login from ', `location`, ' via ', `device_id`, ' (ip ', `ip_address`, ')') AS `line`
-      FROM `user_logins`
+      SELECT l.`user_id`, 'login' AS `event_type`,
+             l.`event_time`,
+             CONCAT('- login from ', l.`location`, ' via ', l.`device_id`, ' (ip ', l.`ip_address`, ')') AS `line`
+      FROM `user_logins` l
+      WHERE EXISTS (
+        SELECT 1 FROM `anomalous_transactions` a
+        WHERE a.`user_id` = l.`user_id`
+          AND ABS(TIMESTAMPDIFF(SECOND, l.`event_time`, a.`event_time`)) < 10
+      )
       UNION ALL
-      SELECT `user_id`, 'account_change' AS `event_type`, `event_time`,
-             CONCAT('- ', `field_changed`, ' changed from "', `old_value`, '" to "', `new_value`, '"') AS `line`
-      FROM `account_changes`
+      SELECT c.`user_id`, 'account_change' AS `event_type`,
+             c.`event_time`,
+             CONCAT('- ', c.`field_changed`, ' changed from "', c.`old_value`, '" to "', c.`new_value`, '"') AS `line`
+      FROM `account_changes` c
+      WHERE EXISTS (
+        SELECT 1 FROM `anomalous_transactions` a
+        WHERE a.`user_id` = c.`user_id`
+          AND ABS(TIMESTAMPDIFF(SECOND, c.`event_time`, a.`event_time`)) < 10
+      )
     )
     SELECT
       `user_id`,
       `window_start`,
       `window_end`,
       CONCAT(
+        'STATISTICAL ANOMALY DETECTED (ARIMA on 15s windowed spending)\n\n',
         'User: ', `user_id`, '\n\n',
         'Transactions:\n', COALESCE(LISTAGG(CASE WHEN `event_type` = 'transaction' THEN `line` END, '\n'), '  (none)'), '\n\n',
         'Logins:\n', COALESCE(LISTAGG(CASE WHEN `event_type` = 'login' THEN `line` END, '\n'), '  (none)'), '\n\n',
@@ -456,6 +597,7 @@ module "profiles" {
     module.tbl_transactions,
     module.tbl_user_logins,
     module.tbl_account_changes,
+    module.tbl_anomalous_transactions,
   ]
 }
 

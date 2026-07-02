@@ -1,14 +1,15 @@
 """Generates synthetic transaction, login, and account change events.
 
-Produces a mix of ~80% normal activity and ~20% fraud scenarios to three
-Confluent Cloud Kafka topics. Run this after `terraform apply` (which writes
-.env) and alongside the Streamlit dashboard.
+Modes:
+  (default)      - Normal user activity only, continuously
+  --fraud        - Fraud scenarios only, continuously
+  --single-fraud - Generate one fraud event and exit
+  --both         - Normal + fraud after cycle 50 (for ARIMA baseline building)
 
-The datagen logic (users, scenarios, cadence) is unchanged from the original
-local demo — only the connection (SASL_SSL) and value serialization (Avro via
-Schema Registry, matching the Flink-created tables) differ.
+Run this after `terraform apply` (which writes .env) and alongside the Streamlit dashboard.
 """
 
+import argparse
 import os
 import random
 import sys
@@ -78,7 +79,7 @@ ACCOUNT_CHANGE_SCHEMA = """{
   ]
 }""" % NAMESPACE
 
-USERS = [f"user-{i:03d}" for i in range(1, 11)]
+USERS = [f"user-{i:03d}" for i in range(1, 201)]  # Increased from 10 to 200 for ARIMA baseline
 DEVICES = ["iphone-15", "pixel-8", "macbook-pro", "windows-desktop", "ipad-air"]
 MERCHANTS = [
     ("Starbucks", "food_and_drink"),
@@ -98,6 +99,42 @@ CITIES = [
     ("Chicago, IL", "203.0.113.42"),
     ("Sydney, Australia", "192.0.2.100"),
 ]
+
+# User profiles for realistic spending baselines (ARIMA learns per-user patterns)
+USER_PROFILES = {
+    "low_spender": {
+        "users": USERS[:140],  # 70% of users
+        "avg_amount": 35.0,
+        "std_amount": 15.0,
+        "txn_per_cycle": 2,
+    },
+    "medium_spender": {
+        "users": USERS[140:180],  # 20% of users
+        "avg_amount": 150.0,
+        "std_amount": 50.0,
+        "txn_per_cycle": 3,
+    },
+    "high_spender": {
+        "users": USERS[180:198],  # 9% of users - should NOT trigger anomalies
+        "avg_amount": 800.0,
+        "std_amount": 200.0,
+        "txn_per_cycle": 5,
+    },
+    "fraud_target": {
+        "users": USERS[198:200],  # 1% of users - normally low, so fraud is very anomalous
+        "avg_amount": 40.0,
+        "std_amount": 20.0,
+        "txn_per_cycle": 2,
+    },
+}
+
+
+def get_user_profile(user_id):
+    """Get the spending profile for a user."""
+    for profile_type, config in USER_PROFILES.items():
+        if user_id in config["users"]:
+            return profile_type, config
+    return "low_spender", USER_PROFILES["low_spender"]
 
 
 def now_ms():
@@ -141,7 +178,7 @@ def produce_event(producer, serializers, topic, event):
     value = serializers[topic](event, SerializationContext(topic, MessageField.VALUE))
     key = _key_serializer(event["user_id"], SerializationContext(topic, MessageField.KEY))
     producer.produce(topic=topic, key=key, value=value, callback=delivery_report)
-    producer.poll(0)
+    # Removed per-message poll() - now using periodic polling in main loop for better performance
 
 
 def make_transaction(user_id, amount=None, merchant=None, location=None):
@@ -180,20 +217,21 @@ def make_account_change(user_id, field="preferences", old_val="default", new_val
 
 
 def normal_activity(producer, serializers, user_id):
-    """Normal user: login from one city, 1-2 small purchases nearby."""
+    """Normal user: login from one city, purchases matching their profile baseline."""
+    profile_type, config = get_user_profile(user_id)
     city = random.choice(CITIES[:3])
 
     login = make_login(user_id, location=city)
     produce_event(producer, serializers, TOPIC_LOGINS, login)
-    print(f"  [normal] {user_id} login from {city[0]}")
+    print(f"  [{profile_type}] {user_id} login from {city[0]}")
 
-    time.sleep(random.uniform(0.5, 2))
-
-    for _ in range(random.randint(1, 2)):
-        txn = make_transaction(user_id, amount=round(random.uniform(5, 80), 2), location=city)
+    # Generate transactions with Gaussian distribution around user's baseline
+    for _ in range(config["txn_per_cycle"]):
+        # Normal distribution around user's average, ensuring minimum $5
+        amount = max(5.0, random.gauss(config["avg_amount"], config["std_amount"]))
+        txn = make_transaction(user_id, amount=round(amount, 2), location=city)
         produce_event(producer, serializers, TOPIC_TRANSACTIONS, txn)
-        print(f"  [normal] {user_id} txn ${txn['amount']:.2f} at {txn['merchant']} in {city[0]}")
-        time.sleep(random.uniform(0.3, 1))
+        print(f"  [{profile_type}] {user_id} txn ${txn['amount']:.2f} at {txn['merchant']}")
 
 
 def fraud_geo_impossible(producer, serializers, user_id):
@@ -201,8 +239,6 @@ def fraud_geo_impossible(producer, serializers, user_id):
     login = make_login(user_id, location=CITIES[2])  # Tokyo
     produce_event(producer, serializers, TOPIC_LOGINS, login)
     print(f"  [FRAUD:geo] {user_id} login from Tokyo")
-
-    time.sleep(0.5)
 
     txn = make_transaction(
         user_id,
@@ -259,30 +295,149 @@ def fraud_velocity(producer, serializers, user_id):
 FRAUD_SCENARIOS = [fraud_geo_impossible, fraud_account_takeover, fraud_velocity]
 
 
-def main():
-    print(f"Connecting to Confluent Cloud at {BOOTSTRAP}...")
-    producer = make_producer()
-    serializers = build_serializers()
-    print("Connected. Generating events (Ctrl+C to stop).\n")
+def parse_args():
+    """Parse command-line arguments to determine generation mode."""
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic fraud detection events for Confluent Cloud"
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--fraud",
+        action="store_true",
+        help="Generate fraud scenarios only (continuous loop)"
+    )
+    mode_group.add_argument(
+        "--single-fraud",
+        action="store_true",
+        help="Generate a single fraud event and exit"
+    )
+    mode_group.add_argument(
+        "--both",
+        action="store_true",
+        help="Generate both normal and fraud events (fraud starts after cycle 50)"
+    )
+    return parser.parse_args()
 
-    cycle = 0
-    while True:
-        cycle += 1
-        print(f"--- Cycle {cycle} ({datetime.now().strftime('%H:%M:%S')}) ---")
 
-        random.shuffle(USERS)
+def generate_normal_cycle(producer, serializers, cycle):
+    """Generate one cycle of normal user activity."""
+    print(f"--- Cycle {cycle} ({datetime.now().strftime('%H:%M:%S')}) ---")
 
-        for user_id in USERS[:6]:
-            normal_activity(producer, serializers, user_id)
+    random.shuffle(USERS)
 
-        fraud_user = random.choice(USERS[6:])
+    # 80% of users do normal activity
+    for idx, user_id in enumerate(USERS[:160]):
+        normal_activity(producer, serializers, user_id)
+
+        # Periodic polling
+        if idx % 50 == 0:
+            producer.poll(0)
+
+    producer.poll(0)
+
+
+def generate_fraud_cycle(producer, serializers, cycle):
+    """Generate one cycle of fraud scenarios."""
+    print(f"--- Fraud Cycle {cycle} ({datetime.now().strftime('%H:%M:%S')}) ---")
+
+    fraud_target_users = USER_PROFILES["fraud_target"]["users"]
+
+    # Generate 2 fraud scenarios per cycle
+    for _ in range(2):
+        fraud_user = random.choice(fraud_target_users)
         fraud_fn = random.choice(FRAUD_SCENARIOS)
         fraud_fn(producer, serializers, fraud_user)
 
+    producer.poll(0)
+
+
+def generate_mixed_cycle(producer, serializers, cycle):
+    """Generate one cycle of normal + fraud (after cycle 50)."""
+    print(f"--- Cycle {cycle} ({datetime.now().strftime('%H:%M:%S')}) ---")
+
+    random.shuffle(USERS)
+    fraud_target_users = USER_PROFILES["fraud_target"]["users"]
+
+    # Normal activity
+    for idx, user_id in enumerate(USERS[:160]):
+        normal_activity(producer, serializers, user_id)
+
+        if idx % 50 == 0:
+            producer.poll(0)
+
+    # Add fraud after cycle 50 (ARIMA baseline)
+    if cycle > 50:
+        for _ in range(2):
+            fraud_user = random.choice(fraud_target_users)
+            fraud_fn = random.choice(FRAUD_SCENARIOS)
+            fraud_fn(producer, serializers, fraud_user)
+    else:
+        print(f"  [baseline building] {50 - cycle} cycles until fraud scenarios start")
+
+    producer.poll(0)
+
+
+def generate_single_fraud(producer, serializers):
+    """Generate a single fraud event and exit."""
+    print(f"Generating single fraud event at {datetime.now().strftime('%H:%M:%S')}")
+
+    fraud_target_users = USER_PROFILES["fraud_target"]["users"]
+    fraud_user = random.choice(fraud_target_users)
+    fraud_fn = random.choice(FRAUD_SCENARIOS)
+
+    print(f"Selected scenario: {fraud_fn.__name__} for user {fraud_user}")
+    fraud_fn(producer, serializers, fraud_user)
+
+    producer.poll(0)
+    print("Fraud event generated.")
+
+
+def main():
+    args = parse_args()
+
+    print(f"Connecting to Confluent Cloud at {BOOTSTRAP}...")
+    producer = make_producer()
+    serializers = build_serializers()
+    print("Connected.\n")
+
+    # Determine mode
+    if args.single_fraud:
+        print("Mode: Single fraud event\n")
+        try:
+            generate_single_fraud(producer, serializers)
+        finally:
+            print("Flushing messages...")
+            producer.flush()
+            print("Done.")
+        return  # Exit after single fraud
+
+    # Continuous modes
+    if args.fraud:
+        cycle_fn = generate_fraud_cycle
+        print("Mode: Continuous fraud generation (Ctrl+C to stop)\n")
+    elif args.both:
+        cycle_fn = generate_mixed_cycle
+        print("Mode: Mixed (normal + fraud after cycle 50) (Ctrl+C to stop)\n")
+    else:
+        cycle_fn = generate_normal_cycle
+        print("Mode: Normal transactions only (Ctrl+C to stop)\n")
+
+    cycle = 0
+
+    try:
+        while True:
+            cycle += 1
+            cycle_fn(producer, serializers, cycle)
+
+            wait = random.uniform(2.0, 3.0)
+            print(f"\nCycle complete, waiting {wait:.1f}s...\n")
+            time.sleep(wait)
+    except KeyboardInterrupt:
+        print("\n\nShutting down gracefully...")
+    finally:
+        print("Flushing remaining messages...")
         producer.flush()
-        wait = random.uniform(5, 15)
-        print(f"\nWaiting {wait:.0f}s before next cycle...\n")
-        time.sleep(wait)
+        print("Producer stopped.")
 
 
 if __name__ == "__main__":
