@@ -1,390 +1,357 @@
-# ARIMA-Enhanced Fraud Detection
+# ARIMA Enhancement: Parallel Pipeline Architecture
 
-This enhancement adds **windowed statistical anomaly detection** (ARIMA) as a pre-filter before LLM analysis, reducing costs by ~95% while improving detection accuracy.
+**Date:** 2026-07-02  
+**Status:** Implemented
 
-## What Changed
+## Overview
 
-### Architecture
+This document describes the integration of ARIMA-based statistical anomaly detection with session-based activity profiling in the fraud detection pipeline. The enhancement combines two independent windowing strategies through a parallel pipeline architecture.
 
-**Before:**
+## Problem Statement
+
+The original fraud detection system used session-based activity profiling:
+- **Input:** Raw event streams (transactions, logins, account changes)
+- **Processing:** 3-second SESSION windows to capture burst activity
+- **Output:** Activity profiles sent to fraud detection agent
+
+**Limitation:** No statistical baseline for "normal" vs "anomalous" spending patterns. The agent analyzed all profiles equally, making it harder to distinguish legitimate high-value purchases from actual fraud.
+
+**Goal:** Add ARIMA time-series anomaly detection to pre-filter activity profiles, sending only statistically anomalous patterns to the agent.
+
+## Initial Approach (Failed)
+
+**Attempted flow:**
 ```
-Events → Session Window → LLM Analysis (all users) → Alerts
+transactions → TUMBLE(15s) → ARIMA → anomalous_windows
+                                          ↓
+                                   JOIN transactions
+                                          ↓
+                                 anomalous_transactions
+                                          ↓
+                       UNION(user_logins, account_changes)
+                                          ↓
+                                   SESSION(3s)
+                                          ↓
+                                   activity_profiles
 ```
 
-**After:**
+**Critical error:** Time attribute preservation failure
 ```
-Events → 15s TUMBLE Windows → ARIMA (on aggregated spending) → Join Transactions → Session Window → LLM Analysis → Alerts
+The window function requires the timecol is a time attribute type, 
+but is TIMESTAMP_WITH_LOCAL_TIME_ZONE(3).
 ```
 
-### Key Benefits
+**Root cause:** Flink SQL time attributes are **lost** when materializing through CTAS:
+1. `transactions.event_time` is a **time attribute** (computed column with watermark)
+2. After `CREATE TABLE anomalous_transactions AS SELECT t.event_time FROM transactions t JOIN ...`, `anomalous_transactions.event_time` becomes a **regular TIMESTAMP_LTZ(3)** (time attribute property is stripped)
+3. UNION of time attribute (from base table) + regular timestamp (from CTAS) → result is regular timestamp
+4. SESSION window requires time attribute → fails
 
-- **95% cost reduction**: Only users with anomalous spending windows trigger LLM calls
-- **Better accuracy**: Statistical baseline on spending velocity + contextual reasoning
-- **No false positives on high spenders**: ARIMA learns per-user spending patterns
-- **Explainable**: Shows window total, expected amount, and LLM reasoning
-- **Correct pattern**: Matches Confluent reference architecture (window → aggregate → ML)
+**Key insight from CC Flink Reference (Trap #8):**
+> `$rowtime AS alias` in CTE silently strips time-attribute property; watermarks break downstream
 
----
+**Extrapolated rule:**
+- Time attributes exist **only** in base table computed columns with watermarks
+- CTAS results lose time attribute properties → become regular timestamps
+- **Never** try to window on CTAS-derived timestamp columns
+- **Do** windowing on base tables, **then** materialize, **then** join
+
+## Solution: Parallel Pipeline Architecture
+
+Instead of trying to preserve time attributes through joins and re-windowing, we split the processing into two **independent** parallel pipelines that each do their own windowing, then join the **materialized results**.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐
+│   Path 1: Activity Profiling        │    │   Path 2: Anomaly Detection         │
+│                                      │    │                                     │
+│  transactions (base table)           │    │  transactions (base table)          │
+│  user_logins (base table)            │    │         ↓                           │
+│  account_changes (base table)        │    │  TUMBLE(15s windows)                │
+│         ↓                            │    │         ↓                           │
+│  UNION ALL (preserves time attrs)    │    │  GROUP BY user_id, window           │
+│         ↓                            │    │         ↓                           │
+│  SESSION(3s inactivity gap)          │    │  ML_DETECT_ANOMALIES (ARIMA)        │
+│         ↓                            │    │    - minTrainingSize: 8             │
+│  GROUP BY + LISTAGG                  │    │    - maxTrainingSize: 100           │
+│         ↓                            │    │    - confidencePercentage: 95%      │
+│  CTAS → activity_profiles            │    │         ↓                           │
+│    (materialized, regular timestamps)│    │  Filter: is_anomaly=TRUE            │
+│                                      │    │          total > upper_bound        │
+│                                      │    │         ↓                           │
+│                                      │    │  CTAS → anomalous_windows           │
+│                                      │    │    (materialized, regular timestamps)│
+└──────────────┬───────────────────────┘    └────────────┬────────────────────────┘
+               │                                         │
+               └────────────── JOIN ─────────────────────┘
+                     ON user_id AND window overlap
+                              ↓
+                      anomalous_profiles
+                              ↓
+                   enrich with ARIMA context
+                              ↓
+                anomalous_profiles_enriched
+                              ↓
+                        AI_RUN_AGENT
+                              ↓
+                        fraud_alerts
+```
+
+### Why This Works
+
+**Path 1 (Activity Profiling):**
+- UNION ALL on **base tables** → all have time attributes → preserves time attribute property
+- SESSION window operates on proper time attribute
+- CTAS materializes result → `window_start`/`window_end` become regular timestamps (windowing complete)
+
+**Path 2 (Anomaly Detection):**
+- TUMBLE window on **base table** → has time attribute
+- ARIMA detection on aggregates
+- CTAS materializes result → `window_start`/`window_end` become regular timestamps (windowing complete)
+
+**Join:**
+- Both sides are **regular tables** with **regular timestamp columns**
+- No time attributes needed → simple temporal overlap join
+- Overlap condition: `p.window_start < w.window_end AND p.window_end > w.window_start`
+
+## Pipeline Stages
+
+### Stage 1: ARIMA Scoring (All Windows)
+
+**Table:** `arima_scored_windows`
+
+```sql
+CREATE TABLE arima_scored_windows (
+  user_id STRING NOT NULL,
+  window_start TIMESTAMP_LTZ(3) NOT NULL,
+  window_end TIMESTAMP_LTZ(3),
+  txn_count BIGINT,
+  total_amount DOUBLE,
+  expected_amount DOUBLE,  -- ARIMA forecast
+  upper_bound DOUBLE,
+  lower_bound DOUBLE,
+  is_anomaly BOOLEAN,
+  PRIMARY KEY (user_id) NOT ENFORCED
+) WITH ('changelog.mode' = 'append');
+```
+
+**Purpose:** Score **all** 15-second spending windows with ARIMA, providing observability into normal vs anomalous patterns.
+
+### Stage 2: Filter to Anomalous Windows
+
+**Table:** `anomalous_windows`
+
+```sql
+SELECT * FROM arima_scored_windows
+WHERE is_anomaly = TRUE 
+  AND total_amount > upper_bound;
+```
+
+**Purpose:** Narrow to windows that are both statistically anomalous **and** exceed the upper confidence bound.
+
+### Stage 3: Build Activity Profiles (All Users)
+
+**Table:** `activity_profiles`
+
+```sql
+WITH unified AS (
+  SELECT user_id, event_type, event_time, line
+  FROM transactions
+  UNION ALL
+  SELECT user_id, event_type, event_time, line
+  FROM user_logins
+  UNION ALL
+  SELECT user_id, event_type, event_time, line
+  FROM account_changes
+)
+SELECT
+  user_id,
+  window_start,
+  window_end,
+  CONCAT(
+    'User: ', user_id, '\n\n',
+    'Transactions:\n', LISTAGG(...), '\n\n',
+    'Logins:\n', LISTAGG(...), '\n\n',
+    'Account changes:\n', LISTAGG(...)
+  ) AS profile_text
+FROM TABLE(
+  SESSION(TABLE unified, DESCRIPTOR(event_time), INTERVAL '3' SECONDS)
+)
+GROUP BY user_id, window_start, window_end;
+```
+
+**Purpose:** Capture **burst activity** patterns. 3-second inactivity gap means rapid sequences of events (e.g., login → email change → multiple transactions) are grouped together, forming a narrative of suspicious behavior.
+
+**Key characteristic:** Processes **all** users, not just anomalous ones. Profiling and anomaly detection are independent.
+
+### Stage 4: Filter Profiles to Anomalous Windows
+
+**Table:** `anomalous_profiles`
+
+```sql
+SELECT 
+  p.user_id,
+  p.window_start AS profile_start,
+  p.window_end AS profile_end,
+  p.profile_text,
+  w.window_start AS arima_window_start,
+  w.window_end AS arima_window_end,
+  w.total_amount AS window_total,
+  w.expected_amount,
+  w.upper_bound,
+  w.lower_bound
+FROM activity_profiles p
+INNER JOIN anomalous_windows w
+  ON p.user_id = w.user_id
+  AND p.window_start < w.window_end
+  AND p.window_end > w.window_start;
+```
+
+**Purpose:** Combine session-based burst detection with statistical anomaly detection. Only profiles that **temporally overlap** with ARIMA-flagged windows proceed to the agent.
+
+**Overlap semantics:** A session window that touches an anomalous ARIMA window gets flagged, even if the session includes some events outside the ARIMA window. This preserves full context (e.g., a login at t=13s followed by anomalous spending at t=16s).
+
+### Stage 5: Enrich with ARIMA Context
+
+**Table:** `anomalous_profiles_enriched`
+
+**Purpose:** Prepend ARIMA anomaly context to the activity profile text. The agent sees both the statistical signal (spending is 3x higher than expected) and the detailed activity narrative.
+
+### Stage 6: Agent Analysis
+
+**Table:** `fraud_alerts`
+
+**Purpose:** Run the fraud detection agent only on profiles that were pre-filtered by ARIMA. The agent performs contextual analysis on top of the statistical signal.
+
+**Agent's updated role:** No longer analyzing raw volume/velocity (ARIMA already flagged that). Instead, looks for supporting fraud signals:
+- Geographic impossibility (transaction in NYC, login in Tokyo minutes apart)
+- Account takeover (email change + password change + rapid purchases)
+- Device/IP anomalies combined with ARIMA anomaly
+- Contextual mismatch (ARIMA flagged it but context suggests legitimate holiday shopping)
+
+## Key Implementation Details
+
+### PRIMARY KEYs and Kafka Message Keys
+
+All intermediate tables use `PRIMARY KEY (user_id) NOT ENFORCED` with `'changelog.mode' = 'append'`:
+
+**Effect:**
+- Kafka message key = `user_id` only (not compound key with window timestamps)
+- All events for the same user go to the same partition
+- Multiple windows for the same user are separate append-only messages
+- Window columns remain in the message value/payload
+
+**Rationale:** Partitioning by user ensures co-location of related events, enabling downstream consumers to maintain per-user state efficiently.
+
+### CREATE TABLE + INSERT INTO Pattern
+
+Each intermediate table is defined using two modules:
+1. **CREATE TABLE module** - defines schema with PRIMARY KEY
+2. **INSERT INTO module** - contains the query logic
+
+**Rationale:** CTAS (CREATE TABLE AS SELECT) in Confluent Cloud Flink doesn't support PRIMARY KEY definitions. The two-module pattern enables both message keys and append-only semantics.
+
+### Watermark Idle-Timeout Pinning
+
+The `insert_activity_profiles` module uses `extra_properties = { "sql.tables.scan.idle-timeout" = "5 s" }`.
+
+**Problem:** Confluent Cloud's default "progressive idleness" grows the idle-partition timeout with statement age (10s → up to 5 min). With 6-partition topics and a producer that only touches some users per cycle, the session-window watermark stalls as the statement ages → alerts dry up.
+
+**Solution:** Pin idle-timeout to 5s. The watermark advances even when some partitions are idle, so session windows close and profiles flow continuously.
+
+## Window Semantics: Both SESSION
+
+**ARIMA windows (SESSION):**
+- Variable-length windows with 3-second inactivity gap
+- Per-user partitioning (`PARTITION BY user_id`) - separate session streams per user
+- Event-driven: window extends until 3s of silence
+- Each session produces one aggregate: `total_amount = SUM(transaction amounts in session)`
+- Purpose: Analyze spending patterns at activity-burst granularity
+
+**Activity profiles (SESSION):**
+- Identical SESSION parameters to ARIMA (`PARTITION BY user_id`, 3-second gap)
+- Captures full narrative of each activity burst
+- Perfect 1:1 alignment with ARIMA windows (same session = same window boundaries)
+
+**Benefits of SESSION for both:**
+- **Semantic clarity**: Each analysis unit is a user activity burst, not an arbitrary time slice
+- **Perfect alignment**: Same window boundaries for ARIMA and profiling → 1:1 join on `(user_id, window_start)`
+- **Natural fraud capture**: Variable fraud durations (1-1.5s) fit naturally in variable-length sessions
+- **Adaptive**: Long fraud bursts (e.g., 6 rapid transactions over 1.5s) captured in one window, closed after 3s idle
+
+**ARIMA on irregular intervals:**
+ARIMA analyzes the **sequence of session aggregates** across time:
+```
+User user-001:
+  Session 1 (t=1.2-4.8s):  total=$105
+  [14s gap - no activity]
+  Session 2 (t=18.3-21.5s): total=$850  ← ARIMA detects anomaly
+  [11s gap]
+  Session 3 (t=32.1-34.9s): total=$95
+```
+
+The irregular gaps between sessions are acceptable because ARIMA forecasts **"what should the next session total be?"** based on historical session totals, not time-of-day patterns. Each session is one data point in the time series, regardless of the gap to the previous session.
+
+## Benefits of Parallel Pipeline Architecture
+
+1. **Separation of concerns:**
+   - ARIMA handles statistical baseline (volume/velocity anomalies)
+   - SESSION windows handle burst detection (rapid event sequences)
+   - Agent handles contextual analysis (geo-impossible, account takeover, etc.)
+
+2. **No time attribute issues:**
+   - Each path does its own windowing on base tables
+   - Join happens on materialized results with regular timestamps
+   - No need to preserve time attributes through complex query chains
+
+3. **Observability:**
+   - `arima_scored_windows` topic shows all scored windows (normal + anomalous)
+   - `activity_profiles` topic shows all session-windowed profiles
+   - `anomalous_profiles` topic shows filtered result of join
+
+4. **Alignment:**
+   - ARIMA and activity profiling use identical SESSION parameters (3s gap, partitioned by user_id)
+   - Perfect 1:1 window correspondence enables exact equality join
+   - Can adjust ARIMA confidence threshold without changing profiling logic
+   - Can modify profile text format without touching ARIMA logic
+   - **Note**: SESSION gap must remain synchronized between both paths to maintain alignment
+
+5. **Efficiency:**
+   - Agent only analyzes pre-filtered profiles (reduces LLM invocations)
+   - ARIMA pre-filtering reduces false positives reaching the agent
+   - Partitioning by user_id ensures efficient state management
+
+## Trade-offs
+
+**Cons:**
+- Two identical SESSION windowing operations (ARIMA + profiling) = duplicate state per session
+- Profiles for **all** users, not just anomalous ones (could be optimized in production)
+- ARIMA trained on irregular intervals (gaps between sessions vary by user activity)
+
+**Pros from SESSION alignment:**
+- Perfect 1:1 window correspondence (no many-to-many joins)
+- Simpler join condition (exact equality vs temporal overlap)
+- Semantically meaningful analysis units (activity bursts, not arbitrary time slices)
+
+**Empirical validation needed:**
+- Does Flink's `ML_DETECT_ANOMALIES` handle irregular session timing well?
+- Does forecast accuracy degrade compared to regular TUMBLE intervals?
+- How long to accumulate `minTrainingSize: 8` sessions for typical users?
+
+**Production optimization:** For very high-volume deployments, Path 1 could be modified to only profile users with recent anomalous windows (requires tracking user state).
 
 ## Files Modified
 
-### 1. **producer/generate_events.py**
-- **Users**: Increased from 10 → 200 for statistical significance
-- **User profiles**: 4 spending tiers (low/medium/high/fraud_target)
-- **Distribution**: Gaussian (not uniform) to create realistic baselines
-- **Cycle speed**: 2s (not 5-15s) for faster baseline building
-- **Fraud delay**: Waits 50 cycles (~100s) before introducing fraud so ARIMA can train
-
-### 2. **terraform/flink.tf**
-Added 4 new/modified statements:
-
-#### a. New `anomalous_windows` table
-Detects anomalous spending windows using the **correct pattern**:
-1. **TUMBLE window** (15 seconds) to aggregate per-user spending
-2. **ML_DETECT_ANOMALIES** on aggregated `total_amount` (not individual transactions)
-3. **Explicit configuration** via JSON_OBJECT (minTrainingSize=8, confidencePercentage=95)
-4. **RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW** for proper historical context
-
-```sql
-WITH windowed_spending AS (
-  SELECT window_time, user_id, 
-         SUM(amount) AS total_amount,
-         COUNT(*) AS txn_count
-  FROM TABLE(TUMBLE(TABLE transactions, DESCRIPTOR(event_time), INTERVAL '15' SECOND))
-  GROUP BY window_time, user_id
-)
-SELECT user_id, window_start, window_end, total_amount, expected_amount,
-       anomaly_result.is_anomaly
-FROM (
-  SELECT *,
-    ML_DETECT_ANOMALIES(total_amount, window_time, JSON_OBJECT(...))
-      OVER (PARTITION BY user_id ORDER BY window_time
-            RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS anomaly_result
-  FROM windowed_spending
-)
-WHERE anomaly_result.is_anomaly = TRUE
-  AND total_amount > anomaly_result.upper_bound
-```
-
-Returns: `window_start`, `window_end`, `total_amount`, `expected_amount`, `upper_bound`, `lower_bound`, `is_anomaly`
-
-#### b. New `anomalous_transactions` table
-Joins individual transactions back to anomalous windows for downstream processing
-
-#### c. Modified `activity_profiles` table
-- **Only processes users with anomalous spending windows**
-- Enriches transaction lines with `[WINDOW ANOMALY: total=$X, expected=$Y]`
-- Shows aggregate spending context (what ARIMA actually saw)
-- Joins logins/account_changes within 10s for full context
-
-#### d. Updated `fraud_detection_agent` prompt
-- Explains windowed ARIMA pre-filtering to Claude
-- Emphasizes that ARIMA detected a **spending burst** (velocity), not just high amounts
-- Asks for contextual analysis: "Is this spending pattern actually fraud?"
-- Updated scoring guide emphasizing ARIMA velocity signal + fraud patterns
-
-### 3. **dashboard/app.py**
-- Added `anomalous_transactions` to `TOPICS`
-- New metrics: **ARIMA Anomalies** and **Anomaly Rate**
-- Color-coded anomaly events in live feed (orange)
-- 8 metric columns (was 6)
-
----
-
-## Why Windowed ARIMA?
-
-### The Problem with Per-Transaction ARIMA
-
-Initially, we tried running ML_DETECT_ANOMALIES directly on individual transaction amounts:
-```sql
-SELECT *, ML_DETECT_ANOMALIES(amount, event_time) OVER (...)
-FROM transactions
-```
-
-**This doesn't work well because:**
-1. **Too noisy**: Individual transactions have high variance (coffee=$5, laptop=$1500)
-2. **Insufficient history**: ARIMA needs 20-30+ data points per user to train
-3. **Wrong semantic**: We care about **spending patterns** (velocity), not individual amounts
-4. **`is_anomaly` returns NULL**: The function requires aggregated time-series data, not raw events
-
-### The Windowed Solution
-
-Following Confluent's reference architecture:
-```sql
-TUMBLE windows (15s) → aggregate per user → ML_DETECT_ANOMALIES on aggregates
-```
-
-**This works because:**
-1. **Smooth signal**: Aggregating into 15s windows creates a stable time-series
-2. **Fast training**: 8 windows = 2 minutes of data = sufficient baseline
-3. **Right semantic**: Detects "unusual spending burst in this window" = velocity anomaly
-4. **Proper config**: JSON_OBJECT parameters give ARIMA the training constraints it needs
-
-**Example:**
-- User normally spends $50-$100 per 15s window (2-3 transactions)
-- Fraud scenario: $2000 in 15s window (6 rapid transactions) = **anomaly detected**
-- High spender: Consistently $800 per 15s window = **not an anomaly** (learned baseline)
-
----
-
-## Deployment Steps
-
-### Step 1: Deploy Terraform Changes
-
-```bash
-cd terraform
-
-# Plan to see what will be created
-terraform plan
-
-# Apply changes (creates anomalous_transactions table + updates statements)
-terraform apply
-```
-
-**Note**: You'll need to **replace** the `activity_profiles` statement since it changed:
-
-```bash
-terraform apply -replace="module.profiles.confluent_flink_statement.this"
-```
-
-This will:
-- Create the new `anomalous_transactions` table
-- Replace the `activity_profiles` statement (starts fresh from offset 0)
-- Update the agent prompt inline
-
-### Step 2: Run Enhanced Producer
-
-**IMPORTANT**: Run for at least **100 seconds (50 cycles)** before expecting fraud alerts.
-
-```bash
-# Install dependencies if needed
-pip install -r requirements.txt
-
-# Run producer
-python producer/generate_events.py
-```
-
-**What to expect:**
-```
---- Cycle 1 (15:30:45) ---
-  [baseline building] 49 cycles until fraud scenarios start
-  [low_spender] user-001 login from San Francisco, CA
-  [low_spender] user-001 txn $34.52 at Walmart
-  ...
-  
---- Cycle 51 (15:32:15) ---
-  [FRAUD:geo] user-199 login from Tokyo
-  [FRAUD:geo] user-199 txn $1543.23 in New York (impossible travel)
-```
-
-### Step 3: Monitor ARIMA Learning
-
-Check Confluent Cloud UI or query directly:
-
-```sql
--- See raw transactions
-SELECT COUNT(*) FROM transactions;
-
--- See windowed spending (every user, every 15s window)
-SELECT user_id, window_start, total_amount, txn_count
-FROM (
-  SELECT window_start, user_id, 
-         SUM(amount) AS total_amount, COUNT(*) AS txn_count
-  FROM TABLE(TUMBLE(TABLE transactions, DESCRIPTOR(event_time), INTERVAL '15' SECOND))
-  GROUP BY window_start, user_id
-)
-ORDER BY window_start DESC LIMIT 20;
-
--- See ARIMA-flagged anomalous windows (should be ~5-10% of windows)
-SELECT COUNT(*) FROM anomalous_windows;
-
--- See anomaly details (window-level)
-SELECT user_id, window_start, txn_count, total_amount, expected_amount,
-       (total_amount - expected_amount) AS overage
-FROM anomalous_windows
-ORDER BY overage DESC
-LIMIT 10;
-
--- See individual transactions from anomalous windows
-SELECT user_id, transaction_id, amount, merchant, 
-       window_total_amount, expected_amount
-FROM anomalous_transactions
-LIMIT 20;
-```
-
-### Step 4: Run Dashboard
-
-```bash
-# Setup Streamlit config (one-time)
-mkdir -p ~/.streamlit
-echo -e '[general]\nemail = ""' > ~/.streamlit/credentials.toml
-
-# Run dashboard
-streamlit run dashboard/app.py --server.headless true --server.port 8501
-```
-
-Open http://localhost:8501
-
-**New metrics visible:**
-- **ARIMA Anomalies**: Count of transactions flagged by ARIMA
-- **Anomaly Rate**: Percentage of transactions flagged (~5-10% expected)
-- Orange events in live feed = anomalous transactions
-
----
-
-## Expected Results
-
-### During Baseline Building (Cycles 1-50)
-
-- **Transactions**: ~400-500/cycle (160 users × 2-5 txn each)
-- **ARIMA Anomalies**: Initially high (~30-50%), drops to ~5-10% as baseline stabilizes
-- **Fraud Alerts**: **Zero** (no fraud scenarios yet)
-
-### After Baseline (Cycles 51+)
-
-- **Transactions**: Same volume
-- **ARIMA Anomalies**: ~5-10% (mostly fraud scenarios + some legitimate outliers)
-- **Fraud Alerts**: 2-4/cycle (fraud scenarios with high ARIMA scores)
-
-### User Profile Behavior
-
-| Profile | Users | Avg Amount | Expected ARIMA Behavior |
-|---------|-------|------------|------------------------|
-| Low Spender | 140 (70%) | $35 ± $15 | Baseline learns; $200+ flagged |
-| Medium Spender | 40 (20%) | $150 ± $50 | Baseline learns; $400+ flagged |
-| High Spender | 18 (9%) | $800 ± $200 | **Not flagged** (legitimate baseline) |
-| Fraud Target | 2 (1%) | $40 ± $20 | $500+ **strongly flagged** |
-
-**Key point**: High spenders doing $1000 transactions = **NOT anomalous** (ARIMA learned their baseline).  
-Fraud targets doing $1500 transactions = **VERY anomalous** (37x their baseline).
-
----
-
-## Troubleshooting
-
-### "No anomalies showing up" or "`is_anomaly` is NULL"
-
-**Cause**: ARIMA needs sufficient windowed data points per user. With 15s windows, need at least 8 windows (2 minutes of activity).
-
-**Fix**: Wait 50-100 cycles (~2-3 minutes). Check windowed data:
-```sql
--- Count windows per user (need 8+ for minTrainingSize)
-SELECT user_id, COUNT(*) as window_count
-FROM (
-  SELECT window_start, user_id
-  FROM TABLE(TUMBLE(TABLE transactions, DESCRIPTOR(event_time), INTERVAL '15' SECOND))
-  GROUP BY window_start, user_id
-)
-GROUP BY user_id
-ORDER BY window_count DESC;
-```
-
-If `window_count < 8`, ARIMA hasn't reached `minTrainingSize` yet.
-
-### "`is_anomaly` showing as NULL in results"
-
-**Cause**: Running ML_DETECT_ANOMALIES on raw transactions instead of windowed aggregates.
-
-**Fix**: Verify you're using the windowed pattern (TUMBLE → aggregate → ML), not per-transaction.
-
-### "Anomaly rate is 50%+ and not dropping"
-
-**Cause**: Producer not running long enough, or high variance in amounts.
-
-**Fix**: 
-- Ensure producer has run for 50+ cycles
-- Check user profiles are generating Gaussian distributions (not uniform random)
-
-### "High spenders being flagged as anomalous"
-
-**Cause**: ARIMA hasn't learned their baseline yet.
-
-**Fix**: High spenders (user-181 to user-198) need 20+ transactions at ~$800 avg. Wait longer or check their transaction count.
-
-### "Fraud alerts but no ARIMA anomalies"
-
-**Cause**: `activity_profiles` depends on `anomalous_transactions`. If the dependency is broken, profiles might include all users.
-
-**Fix**: Verify in Flink SQL:
-```sql
-SELECT COUNT(*) FROM activity_profiles;
-SELECT COUNT(*) FROM anomalous_transactions;
-```
-
-`activity_profiles` count should be ≤ `anomalous_transactions` count.
-
----
-
-## Metrics to Track
-
-### Producer Logs
-- Cycle count (should reach 50+ before fraud)
-- User profile distribution (70% low, 20% medium, 9% high, 1% fraud)
-- Fraud scenarios starting after cycle 50
-
-### Confluent Cloud (Flink SQL)
-```sql
--- Total transactions
-SELECT COUNT(*) FROM transactions;
-
--- ARIMA anomaly rate
-SELECT 
-  (SELECT COUNT(*) FROM anomalous_transactions) * 100.0 / 
-  (SELECT COUNT(*) FROM transactions) as anomaly_rate_pct;
-
--- Activity profiles (should only exist for anomalous users)
-SELECT COUNT(DISTINCT user_id) FROM activity_profiles;
-
--- Fraud alerts
-SELECT COUNT(*) FROM fraud_alerts;
-```
-
-### Dashboard
-- **Anomaly Rate**: Should stabilize at 5-10% after 50 cycles
-- **ARIMA Anomalies vs Fraud Alerts**: Anomalies >> Alerts (ARIMA is sensitive, LLM is contextual)
-- **High Risk Alerts**: Should correlate with fraud scenarios (geo-impossible, account takeover)
-
----
-
-## Rollback
-
-If you need to revert to the original implementation:
-
-```bash
-cd terraform
-git checkout HEAD~1 -- flink.tf
-terraform apply -replace="module.profiles.confluent_flink_statement.this"
-
-cd ..
-git checkout HEAD~1 -- producer/generate_events.py dashboard/app.py
-```
-
----
-
-## Next Steps
-
-1. **Tune ARIMA sensitivity**: Currently flags `is_anomaly=TRUE` (default confidence ~95%). Could add a threshold on `anomaly_score` for finer control.
-
-2. **Add baseline warmup indicator**: Show "ARIMA learning..." in dashboard until 50 cycles complete.
-
-3. **Compare ARIMA vs LLM accuracy**: Log when ARIMA flags but LLM scores low (<45) — these are false positives to investigate.
-
-4. **Historical baseline**: Pre-populate with 7 days of normal data so ARIMA starts accurate immediately.
-
-5. **Multi-variate ARIMA**: Detect anomalies in transaction velocity (count per window) in addition to amounts.
-
----
-
-## Cost Analysis
-
-### Before ARIMA
-- **200 users** × **3 txn/cycle** × **30 cycles/min** = **18,000 LLM calls/min**
-- At $0.015/call (Claude Sonnet) = **$270/min** = **$16,200/hour**
-
-### After ARIMA
-- **~10 anomalous users/cycle** × **30 cycles/min** = **300 LLM calls/min**
-- At $0.015/call = **$4.50/min** = **$270/hour**
-
-**Savings**: **98.3% reduction** in LLM costs
-
-(Note: ARIMA runs in Flink compute pool, billed as CFUs — marginal cost compared to LLM per-call pricing)
+- `terraform/flink.tf`: All ARIMA and activity profiling logic
+  - Lines 182-292: ARIMA scoring + filtering (2 modules each for CREATE + INSERT)
+  - Lines 603-691: Activity profiling (2 modules for CREATE + INSERT)
+  - Lines 693-759: Anomalous profiles join + enrichment (4 modules)
+  - Lines 836-895: Detection statement (updated to read from enriched profiles)
+
+## References
+
+- Original activity profiling: `.justin/old/activity_profiles.sql`
+- Reference ARIMA pattern: `.justin/reference/claims_anomalies_by_city.sql`
+- Confluent Cloud Flink SQL reference: `.justin/cc-flink-complete-reference.md`
+- Time attribute trap #8: "Aliasing $rowtime in CTE strips time-attribute property"

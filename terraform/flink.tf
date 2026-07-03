@@ -91,6 +91,9 @@ module "tbl_transactions" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
   EOT
 }
@@ -116,6 +119,9 @@ module "tbl_user_logins" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
   EOT
 }
@@ -141,6 +147,9 @@ module "tbl_account_changes" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
   EOT
 }
@@ -175,6 +184,9 @@ module "tbl_fraud_alerts" {
       `expected_amount` DOUBLE,
       `upper_bound` DOUBLE,
       `lower_bound` DOUBLE
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
   EOT
 }
@@ -198,7 +210,41 @@ module "tbl_arima_scored_windows" {
   database         = local.flink_common.database
   statement_name   = "create-table-arima-scored-windows-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `arima_scored_windows` AS
+    CREATE TABLE `arima_scored_windows` (
+      `user_id` STRING NOT NULL,
+      `window_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `window_end` TIMESTAMP_LTZ(3),
+      `txn_count` BIGINT,
+      `total_amount` DOUBLE,
+      `avg_amount` DOUBLE,
+      `max_amount` DOUBLE,
+      `expected_amount` DOUBLE,
+      `upper_bound` DOUBLE,
+      `lower_bound` DOUBLE,
+      `is_anomaly` BOOLEAN,
+      PRIMARY KEY (`user_id`) NOT ENFORCED
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'changelog.mode' = 'append',
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
+    );
+  EOT
+}
+
+module "insert_arima_scored_windows" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "insert-arima-scored-windows-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    INSERT INTO `arima_scored_windows`
     WITH `windowed_spending` AS (
       SELECT
         `window_start`,
@@ -210,7 +256,7 @@ module "tbl_arima_scored_windows" {
         CAST(ROUND(AVG(CAST(`amount` AS DOUBLE)), 2) AS DOUBLE) AS `avg_amount`,
         MAX(CAST(`amount` AS DOUBLE)) AS `max_amount`
       FROM TABLE(
-        TUMBLE(TABLE `transactions`, DESCRIPTOR(`event_time`), INTERVAL '15' SECOND)
+        SESSION(TABLE `transactions` PARTITION BY `user_id`, DESCRIPTOR(`event_time`), INTERVAL '3' SECONDS)
       )
       GROUP BY `window_start`, `window_end`, `window_time`, `user_id`
     ),
@@ -225,12 +271,12 @@ module "tbl_arima_scored_windows" {
         `avg_amount`,
         `max_amount`,
         ML_DETECT_ANOMALIES(
-          `total_amount`,
+          `avg_amount`,
           `window_time`,
           JSON_OBJECT(
-            'minTrainingSize' VALUE 8,
-            'maxTrainingSize' VALUE 100,
-            'confidencePercentage' VALUE 95.0,
+            'minTrainingSize' VALUE 32,
+            'maxTrainingSize' VALUE 128,
+            'confidencePercentage' VALUE 99.5,
             'enableStl' VALUE FALSE
           )
         ) OVER (
@@ -254,7 +300,7 @@ module "tbl_arima_scored_windows" {
       `anomaly_result`.`is_anomaly`
     FROM `anomaly_detection`;
   EOT
-  depends_on       = [module.tbl_transactions]
+  depends_on       = [module.tbl_transactions, module.tbl_arima_scored_windows]
 }
 
 # Stage 2: Filter to only anomalous windows (is_anomaly=true AND above threshold)
@@ -271,7 +317,42 @@ module "tbl_anomalous_windows" {
   database         = local.flink_common.database
   statement_name   = "create-table-anomalous-windows-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_windows` AS
+    CREATE TABLE `anomalous_windows` (
+      `user_id` STRING NOT NULL,
+      `window_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `window_end` TIMESTAMP_LTZ(3),
+      `txn_count` BIGINT,
+      `total_amount` DOUBLE,
+      `avg_amount` DOUBLE,
+      `max_amount` DOUBLE,
+      `expected_amount` DOUBLE,
+      `upper_bound` DOUBLE,
+      `lower_bound` DOUBLE,
+      `is_anomaly` BOOLEAN,
+      WATERMARK FOR `window_start` AS `window_start`,
+      PRIMARY KEY (`user_id`) NOT ENFORCED
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'changelog.mode' = 'append',
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
+    );
+  EOT
+}
+
+module "insert_anomalous_windows" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "insert-anomalous-windows-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    INSERT INTO `anomalous_windows`
     SELECT
       `user_id`,
       `window_start`,
@@ -288,7 +369,7 @@ module "tbl_anomalous_windows" {
     WHERE `is_anomaly` = TRUE
       AND `total_amount` > `upper_bound`;
   EOT
-  depends_on       = [module.tbl_arima_scored_windows]
+  depends_on       = [module.insert_arima_scored_windows, module.tbl_anomalous_windows]
 }
 
 
@@ -536,7 +617,34 @@ module "agent" {
 #
 # NOTE: This processes ALL users (not pre-filtered). ARIMA filtering happens
 # later via join to anomalous_windows.
-module "profiles" {
+module "tbl_activity_profiles" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "create-table-activity-profiles-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    CREATE TABLE `activity_profiles` (
+      `user_id` STRING NOT NULL,
+      `window_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `window_end` TIMESTAMP_LTZ(3),
+      `profile_text` STRING,
+      PRIMARY KEY (`user_id`) NOT ENFORCED
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'changelog.mode' = 'append',
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
+    );
+  EOT
+}
+
+module "insert_activity_profiles" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -555,9 +663,9 @@ module "profiles" {
   extra_properties = {
     "sql.tables.scan.idle-timeout" = "5 s"
   }
-  statement_name = "create-activity-profiles-${random_id.suffix.hex}"
+  statement_name = "insert-activity-profiles-${random_id.suffix.hex}"
   statement      = <<-EOT
-    CREATE TABLE `activity_profiles` AS
+    INSERT INTO `activity_profiles`
     WITH `unified` AS (
       SELECT `user_id`, 'transaction' AS `event_type`, `event_time`,
              CONCAT('- txn ', `transaction_id`, ': $', CAST(`amount` AS STRING),
@@ -591,6 +699,7 @@ module "profiles" {
     module.tbl_transactions,
     module.tbl_user_logins,
     module.tbl_account_changes,
+    module.tbl_activity_profiles,
   ]
 }
 
@@ -599,7 +708,7 @@ module "profiles" {
 # (ARIMA-detected spending anomalies) to keep only profiles that overlap with
 # an anomalous window. This combines session-based burst detection with
 # statistical anomaly detection.
-module "anomalous_profiles" {
+module "tbl_anomalous_profiles" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -610,29 +719,69 @@ module "anomalous_profiles" {
   flink_api_secret = local.flink_common.flink_api_secret
   catalog          = local.flink_common.catalog
   database         = local.flink_common.database
-  statement_name   = "create-anomalous-profiles-${random_id.suffix.hex}"
+  statement_name   = "create-table-anomalous-profiles-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_profiles` AS
+    CREATE TABLE `anomalous_profiles` (
+      `user_id` STRING NOT NULL,
+      `profile_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `arima_window_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `profile_end` TIMESTAMP_LTZ(3),
+      `profile_text` STRING,
+      `arima_window_end` TIMESTAMP_LTZ(3),
+      `txn_count` BIGINT,
+      `window_total` DOUBLE,
+      `avg_amount` DOUBLE,
+      `expected_amount` DOUBLE,
+      `upper_bound` DOUBLE,
+      `lower_bound` DOUBLE,
+      PRIMARY KEY (`user_id`) NOT ENFORCED
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'changelog.mode' = 'append',
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
+    );
+  EOT
+}
+
+module "insert_anomalous_profiles" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  extra_properties = {
+    "sql.tables.scan.idle-timeout" = "5 s"
+  }
+  statement_name   = "insert-anomalous-profiles-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    INSERT INTO `anomalous_profiles`
     SELECT
       p.`user_id`,
       p.`window_start` AS `profile_start`,
+      w.`window_start` AS `arima_window_start`,
       p.`window_end` AS `profile_end`,
       p.`profile_text`,
-      w.`window_start` AS `arima_window_start`,
       w.`window_end` AS `arima_window_end`,
+      w.`txn_count`,
       w.`total_amount` AS `window_total`,
+      w.`avg_amount`,
       w.`expected_amount`,
       w.`upper_bound`,
       w.`lower_bound`
     FROM `activity_profiles` p
     INNER JOIN `anomalous_windows` w
       ON p.`user_id` = w.`user_id`
-      AND p.`window_start` < w.`window_end`
-      AND p.`window_end` > w.`window_start`;
+      AND p.`window_start` BETWEEN w.`window_start` - INTERVAL '5' SECOND AND w.`window_start` + INTERVAL '5' SECOND
   EOT
   depends_on = [
-    module.profiles,
-    module.tbl_anomalous_windows,
+    module.insert_activity_profiles,
+    module.insert_anomalous_windows,
+    module.tbl_anomalous_profiles,
   ]
 }
 
@@ -640,7 +789,7 @@ module "anomalous_profiles" {
 # Prepends ARIMA anomaly context (window stats, expected amounts, thresholds)
 # to the profile text so the agent sees both the statistical anomaly signal
 # and the detailed activity context.
-module "anomalous_profiles_enriched" {
+module "tbl_anomalous_profiles_enriched" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -651,31 +800,70 @@ module "anomalous_profiles_enriched" {
   flink_api_secret = local.flink_common.flink_api_secret
   catalog          = local.flink_common.catalog
   database         = local.flink_common.database
-  statement_name   = "create-enriched-profiles-${random_id.suffix.hex}"
+  statement_name   = "create-table-enriched-profiles-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_profiles_enriched` AS
+    CREATE TABLE `anomalous_profiles_enriched` (
+      `user_id` STRING NOT NULL,
+      `profile_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `arima_window_start` TIMESTAMP_LTZ(3) NOT NULL,
+      `profile_end` TIMESTAMP_LTZ(3),
+      `arima_window_end` TIMESTAMP_LTZ(3),
+      `txn_count` BIGINT,
+      `window_total` DOUBLE,
+      `avg_amount` DOUBLE,
+      `expected_amount` DOUBLE,
+      `upper_bound` DOUBLE,
+      `lower_bound` DOUBLE,
+      `enriched_profile_text` STRING,
+      PRIMARY KEY (`user_id`) NOT ENFORCED
+    ) DISTRIBUTED INTO 1 BUCKETS
+    WITH (
+      'changelog.mode' = 'append',
+      'kafka.consumer.isolation-level' = 'read-uncommitted'
+    );
+  EOT
+}
+
+module "insert_anomalous_profiles_enriched" {
+  source           = "./modules/flink-statement"
+  organization_id  = local.flink_common.organization_id
+  environment_id   = local.flink_common.environment_id
+  compute_pool_id  = local.flink_common.compute_pool_id
+  principal_id     = local.flink_common.principal_id
+  rest_endpoint    = local.flink_common.rest_endpoint
+  flink_api_key    = local.flink_common.flink_api_key
+  flink_api_secret = local.flink_common.flink_api_secret
+  catalog          = local.flink_common.catalog
+  database         = local.flink_common.database
+  statement_name   = "insert-enriched-profiles-${random_id.suffix.hex}"
+  statement        = <<-EOT
+    INSERT INTO `anomalous_profiles_enriched`
     SELECT
       `user_id`,
       `profile_start`,
-      `profile_end`,
       `arima_window_start`,
+      `profile_end`,
       `arima_window_end`,
+      `txn_count`,
       `window_total`,
+      `avg_amount`,
       `expected_amount`,
       `upper_bound`,
       `lower_bound`,
       CONCAT(
-        'STATISTICAL ANOMALY DETECTED (ARIMA on 15s windowed spending)\n',
-        'Anomalous window: ', CAST(`arima_window_start` AS STRING), ' to ', CAST(`arima_window_end` AS STRING), '\n',
-        'Window total: $', CAST(`window_total` AS STRING),
-        ' (expected: $', CAST(`expected_amount` AS STRING),
+        'STATISTICAL ANOMALY DETECTED (ARIMA on session average transaction amount)\n',
+        'Anomalous session: ', CAST(`arima_window_start` AS STRING), ' to ', CAST(`arima_window_end` AS STRING), '\n',
+        'Session total: $', CAST(`window_total` AS STRING), ' across ', CAST(`txn_count` AS STRING), ' transactions\n',
+        'Average per transaction: $', CAST(`avg_amount` AS STRING),
+        ' (expected avg: $', CAST(`expected_amount` AS STRING),
         ', threshold: $', CAST(`upper_bound` AS STRING), ')\n\n',
         `profile_text`
       ) AS `enriched_profile_text`
     FROM `anomalous_profiles`;
   EOT
   depends_on = [
-    module.anomalous_profiles,
+    module.insert_anomalous_profiles,
+    module.tbl_anomalous_profiles_enriched,
   ]
 }
 
@@ -702,14 +890,14 @@ module "detect" {
       SELECT
         p.`user_id`,
         p.`profile_start`,
-        p.`profile_end`,
-        p.`enriched_profile_text`,
         p.`arima_window_start`,
+        p.`profile_end`,
         p.`arima_window_end`,
         p.`window_total`,
         p.`expected_amount`,
         p.`upper_bound`,
         p.`lower_bound`,
+        p.`enriched_profile_text`,
         CAST(r.`response` AS STRING) AS `raw_response`,
         REGEXP_EXTRACT(CAST(r.`response` AS STRING), '\{[\s\S]*\}', 0) AS `json_text`
       FROM `anomalous_profiles_enriched` p,
@@ -735,7 +923,7 @@ module "detect" {
   EOT
   depends_on = [
     module.agent,
-    module.anomalous_profiles_enriched,
+    module.insert_anomalous_profiles_enriched,
     module.tbl_fraud_alerts,
   ]
 }

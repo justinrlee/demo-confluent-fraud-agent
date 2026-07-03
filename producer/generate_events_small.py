@@ -79,7 +79,7 @@ ACCOUNT_CHANGE_SCHEMA = """{
   ]
 }""" % NAMESPACE
 
-USERS = [f"user-{i:03d}" for i in range(1, 201)]  # Increased from 10 to 200 for ARIMA baseline
+USERS = [f"user-{i:03d}" for i in range(0, 10)]  # Increased from 10 to 200 for ARIMA baseline
 DEVICES = ["iphone-15", "pixel-8", "macbook-pro", "windows-desktop", "ipad-air"]
 MERCHANTS = [
     ("Starbucks", "food_and_drink"),
@@ -103,25 +103,25 @@ CITIES = [
 # User profiles for realistic spending baselines (ARIMA learns per-user patterns)
 USER_PROFILES = {
     "low_spender": {
-        "users": USERS[:140],  # 70% of users
+        "users": USERS[:7],  # 70% of users
         "avg_amount": 35.0,
         "std_amount": 15.0,
         "txn_per_cycle": 2,
     },
     "medium_spender": {
-        "users": USERS[140:180],  # 20% of users
+        "users": USERS[7:8],  # 20% of users
         "avg_amount": 150.0,
         "std_amount": 50.0,
         "txn_per_cycle": 3,
     },
     "high_spender": {
-        "users": USERS[180:198],  # 9% of users - should NOT trigger anomalies
+        "users": USERS[8:9],  # 9% of users - should NOT trigger anomalies
         "avg_amount": 800.0,
         "std_amount": 200.0,
         "txn_per_cycle": 5,
     },
     "fraud_target": {
-        "users": USERS[198:200],  # 1% of users - normally low, so fraud is very anomalous
+        "users": USERS[9:10],  # 1% of users - normally low, so fraud is very anomalous
         "avg_amount": 40.0,
         "std_amount": 20.0,
         "txn_per_cycle": 2,
@@ -326,7 +326,7 @@ def generate_normal_cycle(producer, serializers, cycle):
     random.shuffle(USERS)
 
     # 80% of users do normal activity
-    for idx, user_id in enumerate(USERS[:160]):
+    for idx, user_id in enumerate(USERS[:]):
         normal_activity(producer, serializers, user_id)
 
         # Periodic polling
@@ -380,6 +380,7 @@ def generate_mixed_cycle(producer, serializers, cycle):
 def generate_single_fraud(producer, serializers):
     """Generate a single fraud event and exit."""
     print(f"Generating single fraud event at {datetime.now().strftime('%H:%M:%S')}")
+    print(USER_PROFILES)
 
     fraud_target_users = USER_PROFILES["fraud_target"]["users"]
     fraud_user = random.choice(fraud_target_users)
