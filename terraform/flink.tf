@@ -306,7 +306,7 @@ module "insert_user_activity_scored" {
 }
 
 # Filter to only anomalous user activity sessions
-module "tbl_anomalous_user_activity" {
+module "tbl_user_activity_anomalous" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -319,7 +319,7 @@ module "tbl_anomalous_user_activity" {
   database         = local.flink_common.database
   statement_name   = "create-table-anomalous-user-activity-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_user_activity` (
+    CREATE TABLE `user_activity_anomalous` (
       `user_id` STRING NOT NULL,
       `window_start` TIMESTAMP_LTZ(3) NOT NULL,
       `window_end` TIMESTAMP_LTZ(3),
@@ -344,7 +344,7 @@ module "tbl_anomalous_user_activity" {
   EOT
 }
 
-module "insert_anomalous_user_activity" {
+module "insert_user_activity_anomalous" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -357,17 +357,17 @@ module "insert_anomalous_user_activity" {
   database         = local.flink_common.database
   statement_name   = "insert-anomalous-user-activity-${random_id.suffix.hex}"
   statement        = <<-EOT
-    INSERT INTO `anomalous_user_activity`
+    INSERT INTO `user_activity_anomalous`
     SELECT *
     FROM `user_activity_scored`
     WHERE `is_anomaly` = TRUE
       AND `avg_amount` > `upper_bound`;
   EOT
-  depends_on = [module.insert_user_activity_scored, module.tbl_anomalous_user_activity]
+  depends_on = [module.insert_user_activity_scored, module.tbl_user_activity_anomalous]
 }
 
 # Enrich anomalous user activity with ARIMA context prepended to profile text
-module "tbl_anomalous_user_activity_enriched" {
+module "tbl_user_activity_anomalous_enriched" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -380,7 +380,7 @@ module "tbl_anomalous_user_activity_enriched" {
   database         = local.flink_common.database
   statement_name   = "create-table-anomalous-user-activity-enriched-${random_id.suffix.hex}"
   statement        = <<-EOT
-    CREATE TABLE `anomalous_user_activity_enriched` (
+    CREATE TABLE `user_activity_anomalous_enriched` (
       `user_id` STRING NOT NULL,
       `profile_start` TIMESTAMP_LTZ(3) NOT NULL,
       `arima_window_start` TIMESTAMP_LTZ(3) NOT NULL,
@@ -402,7 +402,7 @@ module "tbl_anomalous_user_activity_enriched" {
   EOT
 }
 
-module "insert_anomalous_user_activity_enriched" {
+module "insert_user_activity_anomalous_enriched" {
   source           = "./modules/flink-statement"
   organization_id  = local.flink_common.organization_id
   environment_id   = local.flink_common.environment_id
@@ -415,7 +415,7 @@ module "insert_anomalous_user_activity_enriched" {
   database         = local.flink_common.database
   statement_name   = "insert-anomalous-user-activity-enriched-${random_id.suffix.hex}"
   statement        = <<-EOT
-    INSERT INTO `anomalous_user_activity_enriched`
+    INSERT INTO `user_activity_anomalous_enriched`
     SELECT
       `user_id`,
       `window_start` AS `profile_start`,
@@ -437,11 +437,11 @@ module "insert_anomalous_user_activity_enriched" {
         ', threshold: $', CAST(`upper_bound` AS STRING), ')\n\n',
         `profile_text`
       ) AS `enriched_profile_text`
-    FROM `anomalous_user_activity`;
+    FROM `user_activity_anomalous`;
   EOT
   depends_on = [
-    module.insert_anomalous_user_activity,
-    module.tbl_anomalous_user_activity_enriched,
+    module.insert_user_activity_anomalous,
+    module.tbl_user_activity_anomalous_enriched,
   ]
 }
 
@@ -511,7 +511,7 @@ module "detect_user_activity" {
         p.`enriched_profile_text`,
         CAST(r.`response` AS STRING) AS `raw_response`,
         REGEXP_EXTRACT(CAST(r.`response` AS STRING), '\{[\s\S]*\}', 0) AS `json_text`
-      FROM `anomalous_user_activity_enriched` p,
+      FROM `user_activity_anomalous_enriched` p,
       LATERAL TABLE(AI_RUN_AGENT(`fraud_detection_agent`, p.`enriched_profile_text`, p.`user_id`)) r
     )
     SELECT
@@ -534,7 +534,7 @@ module "detect_user_activity" {
   EOT
   depends_on = [
     module.agent,
-    module.insert_anomalous_user_activity_enriched,
+    module.insert_user_activity_anomalous_enriched,
     module.tbl_fraud_analysis_results,
   ]
 }
