@@ -80,7 +80,7 @@ ACCOUNT_CHANGE_SCHEMA = """{
   ]
 }""" % NAMESPACE
 
-USERS = [f"user-{i:03d}" for i in range(1, 201)]  # Increased from 10 to 200 for ARIMA baseline
+USERS = [f"user-{i:03d}" for i in range(1, 51)]  # 50 users total
 DEVICES = ["iphone-15", "pixel-8", "macbook-pro", "windows-desktop", "ipad-air"]
 MERCHANTS = [
     ("Starbucks", "food_and_drink"),
@@ -101,28 +101,48 @@ CITIES = [
     ("Sydney, Australia", "192.0.2.100"),
 ]
 
+# Benign account changes for normal users (not fraud indicators)
+BENIGN_ACCOUNT_CHANGES = [
+    ("preferences", "theme-light", "theme-dark"),
+    ("preferences", "theme-dark", "theme-light"),
+    ("language", "en", "es"),
+    ("language", "es", "en"),
+    ("notifications", "email-only", "email+sms"),
+    ("notifications", "email+sms", "email-only"),
+    ("timezone", "UTC-8", "UTC-5"),
+    ("timezone", "UTC-5", "UTC-8"),
+    ("profile_picture", "avatar-1.jpg", "avatar-2.jpg"),
+    ("profile_picture", "avatar-2.jpg", "avatar-3.jpg"),
+    ("bio", "Software engineer", "Senior software engineer"),
+    ("bio", "Data analyst", "Senior data analyst"),
+    ("marketing_opt_in", "true", "false"),
+    ("marketing_opt_in", "false", "true"),
+    ("2fa_method", "sms", "authenticator"),
+    ("2fa_method", "authenticator", "sms"),
+]
+
 # User profiles for realistic spending baselines (ARIMA learns per-user patterns)
 USER_PROFILES = {
-    "low_spender": {
-        "users": USERS[:140],  # 70% of users
+    "normal_spender": {
+        "users": USERS[:30],  # 60% of users
         "avg_amount": 35.0,
         "std_amount": 15.0,
         "txn_per_cycle": 2,
     },
     "medium_spender": {
-        "users": USERS[140:180],  # 20% of users
+        "users": USERS[30:40],  # 20% of users
         "avg_amount": 150.0,
         "std_amount": 50.0,
         "txn_per_cycle": 3,
     },
     "high_spender": {
-        "users": USERS[180:198],  # 9% of users - should NOT trigger anomalies
+        "users": USERS[40:48],  # 16% of users - should NOT trigger anomalies
         "avg_amount": 800.0,
         "std_amount": 200.0,
         "txn_per_cycle": 5,
     },
     "fraud_target": {
-        "users": USERS[198:200],  # 1% of users - normally low, so fraud is very anomalous
+        "users": USERS[48:50],  # 4% of users - normally low, so fraud is very anomalous
         "avg_amount": 40.0,
         "std_amount": 20.0,
         "txn_per_cycle": 2,
@@ -135,7 +155,7 @@ def get_user_profile(user_id):
     for profile_type, config in USER_PROFILES.items():
         if user_id in config["users"]:
             return profile_type, config
-    return "low_spender", USER_PROFILES["low_spender"]
+    return "normal_spender", USER_PROFILES["normal_spender"]
 
 
 def now_ms():
@@ -225,6 +245,13 @@ def normal_activity(producer, serializers, user_id):
     login = make_login(user_id, location=city)
     produce_event(producer, serializers, TOPIC_LOGINS, login)
     print(f"  [{profile_type}] {user_id} login from {city[0]}")
+
+    # Occasionally include a benign account change (15% chance)
+    if random.random() < 0.15:
+        field, old_val, new_val = random.choice(BENIGN_ACCOUNT_CHANGES)
+        change = make_account_change(user_id, field, old_val, new_val)
+        produce_event(producer, serializers, TOPIC_ACCOUNT_CHANGES, change)
+        print(f"  [{profile_type}] {user_id} changed {field}: {old_val} → {new_val}")
 
     # Generate transactions with Gaussian distribution around user's baseline
     for _ in range(config["txn_per_cycle"]):
@@ -327,7 +354,7 @@ def generate_normal_cycle(producer, serializers, cycle):
     random.shuffle(USERS)
 
     # 80% of users do normal activity
-    for idx, user_id in enumerate(USERS[:160]):
+    for idx, user_id in enumerate(USERS[:40]):
         normal_activity(producer, serializers, user_id)
 
         # Periodic polling
@@ -360,7 +387,7 @@ def generate_mixed_cycle(producer, serializers, cycle):
     fraud_target_users = USER_PROFILES["fraud_target"]["users"]
 
     # Normal activity
-    for idx, user_id in enumerate(USERS[:160]):
+    for idx, user_id in enumerate(USERS[:40]):
         normal_activity(producer, serializers, user_id)
 
         if idx % 50 == 0:

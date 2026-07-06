@@ -118,11 +118,11 @@
             opacity: 0.6;
         }
 
-        .btn-user-199 { background: #0984e3; }
-        .btn-user-199:hover:not(:disabled) { background: #0770c7; }
+        .btn-user-049 { background: #0984e3; }
+        .btn-user-049:hover:not(:disabled) { background: #0770c7; }
 
-        .btn-user-200 { background: #6c5ce7; }
-        .btn-user-200:hover:not(:disabled) { background: #5849c9; }
+        .btn-user-050 { background: #6c5ce7; }
+        .btn-user-050:hover:not(:disabled) { background: #5849c9; }
 
         #status {
             padding: 15px;
@@ -201,7 +201,7 @@
         <p class="subtitle">Confluent Cloud Fraud Detection Demo</p>
 
         <div class="info-box">
-            <strong>Demo Mode:</strong> Click a button below to trigger a specific fraud scenario for user-199 or user-200.
+            <strong>Demo Mode:</strong> Click a button below to trigger a specific fraud scenario for user-049 or user-050.
             Events will be sent to Kafka and processed by the Flink streaming agent.
         </div>
 
@@ -216,10 +216,10 @@
                     Login from Tokyo, then purchase in NYC seconds later
                 </div>
                 <div class="user-buttons">
-                    <button class="btn-user-199" onclick="triggerFraud('geo_impossible', 'user-199')">
+                    <button class="btn-user-049" onclick="triggerFraud('geo_impossible', 'user-049')">
                         User 199
                     </button>
-                    <button class="btn-user-200" onclick="triggerFraud('geo_impossible', 'user-200')">
+                    <button class="btn-user-050" onclick="triggerFraud('geo_impossible', 'user-050')">
                         User 200
                     </button>
                 </div>
@@ -235,10 +235,10 @@
                     Email change → Password change → Large purchase
                 </div>
                 <div class="user-buttons">
-                    <button class="btn-user-199" onclick="triggerFraud('account_takeover', 'user-199')">
+                    <button class="btn-user-049" onclick="triggerFraud('account_takeover', 'user-049')">
                         User 199
                     </button>
-                    <button class="btn-user-200" onclick="triggerFraud('account_takeover', 'user-200')">
+                    <button class="btn-user-050" onclick="triggerFraud('account_takeover', 'user-050')">
                         User 200
                     </button>
                 </div>
@@ -254,10 +254,10 @@
                     6 rapid transactions across different merchants
                 </div>
                 <div class="user-buttons">
-                    <button class="btn-user-199" onclick="triggerFraud('velocity', 'user-199')">
+                    <button class="btn-user-049" onclick="triggerFraud('velocity', 'user-049')">
                         User 199
                     </button>
-                    <button class="btn-user-200" onclick="triggerFraud('velocity', 'user-200')">
+                    <button class="btn-user-050" onclick="triggerFraud('velocity', 'user-050')">
                         User 200
                     </button>
                 </div>

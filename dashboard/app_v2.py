@@ -31,7 +31,7 @@ TIMESERIES_BUCKETS = 30
 BUCKET_SECONDS = 10
 
 st.set_page_config(
-    page_title="Fraud Detection Dashboard v2",
+    page_title="Fraud Detection Dashboard",
     page_icon=":shield:",
     layout="wide",
 )
@@ -107,8 +107,8 @@ def create_consumer():
         "sasl.mechanisms": "PLAIN",
         "sasl.username": KAFKA_API_KEY,
         "sasl.password": KAFKA_API_SECRET,
-        "client.id": "fraud-demo-dashboard-v2",
-        "group.id": "dashboard-streamlit-cc-v2",
+        "client.id": "fraud-demo-dashboard",
+        "group.id": "dashboard-streamlit-cc",
         "auto.offset.reset": "latest",
         "enable.auto.commit": True,
     })
@@ -216,30 +216,9 @@ def kafka_polling_thread(state, lock):
 
                     if topic == "fraud_analysis_results":
                         state["alerts"].appendleft({"time": ts, **value})
-
-                        # Categorize severity based on risk_score
-                        risk_score = value.get("risk_score", 0)
-                        if risk_score >= 80:
-                            severity = "Critical"
-                        elif risk_score >= 60:
-                            severity = "High"
-                        elif risk_score >= 40:
-                            severity = "Medium"
-                        else:
-                            severity = "Low"
-
-                        # Initialize user entry if needed
-                        if user_id not in state["user_alert_counts"]:
-                            state["user_alert_counts"][user_id] = {
-                                "Critical": 0,
-                                "High": 0,
-                                "Medium": 0,
-                                "Low": 0
-                            }
-
-                        # Increment severity count
-                        state["user_alert_counts"][user_id][severity] += 1
-
+                        state["user_alert_counts"][user_id] = (
+                            state["user_alert_counts"].get(user_id, 0) + 1
+                        )
                         state["risk_history"].appendleft({
                             "time": ts,
                             "score": value.get("risk_score", 0),
@@ -403,79 +382,21 @@ def render_charts(state):
     user_counts = state["user_alert_counts"]
     if user_counts:
         st.caption("Alerts by User (Top 5)")
-
-        # Sort users by severity priority: Critical desc, High desc, Medium desc, Low desc
-        sorted_users = sorted(
-            user_counts.items(),
-            key=lambda x: (x[1]["Critical"], x[1]["High"], x[1]["Medium"], x[1]["Low"]),
-            reverse=True
-        )[:5]
-
-        # Build DataFrame with one row per user-severity combination
-        data = []
-        user_order = []
-        for user_id, severity_counts in sorted_users:
-            total = sum(severity_counts.values())
-            user_label = f"{user_id} ({total})"
-            user_order.append(user_label)
-
-            for severity in ["Critical", "High", "Medium", "Low"]:
-                count = severity_counts[severity]
-                if count > 0:  # Only include non-zero severities
-                    data.append({
-                        "User": user_label,
-                        "Severity": severity,
-                        "Count": count,
-                        "UserID": user_id  # For tooltip
-                    })
-
-        if data:
-            df = pd.DataFrame(data)
-
-            # Define severity order and colors
-            severity_order = ["Critical", "High", "Medium", "Low"]
-            severity_colors = {
-                "Critical": "#d32f2f",    # Dark red
-                "High": "#f57c00",        # Orange
-                "Medium": "#fbc02d",      # Yellow
-                "Low": "#388e3c"          # Green
-            }
-
-            # Create stacked bar chart
-            chart = (
-                alt.Chart(df)
-                .mark_bar(cornerRadiusEnd=4, opacity=0.85)
-                .encode(
-                    x=alt.X("Count:Q", title="Alert Count", axis=alt.Axis(labelColor="#8888aa", gridColor="#2a2a4a")),
-                    y=alt.Y(
-                        "User:N",
-                        sort=user_order,  # Maintain severity-based sort order
-                        title=None,
-                        axis=alt.Axis(labelColor="#c0c0e0")
-                    ),
-                    color=alt.Color(
-                        "Severity:N",
-                        scale=alt.Scale(
-                            domain=severity_order,
-                            range=[severity_colors[s] for s in severity_order]
-                        ),
-                        legend=alt.Legend(title="Severity", orient="right")
-                    ),
-                    order=alt.Order("SeverityOrder:Q"),  # Stack in correct order
-                    tooltip=[
-                        alt.Tooltip("UserID:N", title="User"),
-                        alt.Tooltip("Severity:N", title="Severity"),
-                        alt.Tooltip("Count:Q", title="Count")
-                    ]
-                )
-                .transform_calculate(
-                    # Add numeric order for stacking (Critical=0, High=1, Medium=2, Low=3)
-                    SeverityOrder="{'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3}[datum.Severity]"
-                )
-                .properties(height=max(len(user_order) * 45, 120))
+        df = pd.DataFrame(
+            [{"User": u, "Alerts": c} for u, c in sorted(user_counts.items(), key=lambda x: -x[1])[:5]]
+        )
+        chart = (
+            alt.Chart(df)
+            .mark_bar(cornerRadiusEnd=4, opacity=0.85)
+            .encode(
+                x=alt.X("Alerts:Q", title="Alert Count", axis=alt.Axis(labelColor="#8888aa", gridColor="#2a2a4a")),
+                y=alt.Y("User:N", sort="-x", title=None, axis=alt.Axis(labelColor="#c0c0e0")),
+                color=alt.value("#ef5350"),
+                tooltip=["User", "Alerts"],
             )
-
-            st.altair_chart(chart.configure_view(stroke=None), width='stretch')
+            .properties(height=max(len(df) * 45, 120))
+        )
+        st.altair_chart(chart.configure_view(stroke=None), width='stretch')
 
 
 def render_alerts_table(alerts_list):
@@ -546,7 +467,7 @@ def main():
 
     state, lock = get_shared_state()
 
-    st.markdown("## :shield: Fraud Detection Dashboard v2 (Severity Breakdown)")
+    st.markdown("## :shield: Fraud Detection Dashboard")
     st.caption(f"Real-time monitoring · Kafka @ `{KAFKA_BOOTSTRAP}`")
 
     with lock:

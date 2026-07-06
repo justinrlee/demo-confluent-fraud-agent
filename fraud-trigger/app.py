@@ -284,7 +284,7 @@ templates = Jinja2Templates(directory="templates")
 class TriggerRequest(BaseModel):
     """Request to trigger a fraud scenario."""
     scenario: Literal["geo_impossible", "account_takeover", "velocity"]
-    user: Literal["user-199", "user-200"]
+    user: Literal["user-049", "user-050"]
 
 
 @app.get("/", response_class=HTMLResponse)
