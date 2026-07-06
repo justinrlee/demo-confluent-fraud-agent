@@ -108,9 +108,13 @@ def create_consumer():
         "sasl.username": KAFKA_API_KEY,
         "sasl.password": KAFKA_API_SECRET,
         "client.id": "fraud-demo-dashboard-v2",
-        "group.id": "dashboard-streamlit-cc-v2",
+        "group.id": f"dashboard-streamlit-cc-v2-{int(time.time())}",
         "auto.offset.reset": "latest",
         "enable.auto.commit": True,
+        "fetch.min.bytes": 1,              # Don't wait to fill batches
+        "fetch.wait.max.ms": 100,          # Max 100ms fetch wait
+        "session.timeout.ms": 10000,       # 10s session timeout
+        "isolation.level": "read_uncommitted",  # Don't wait for transactional commits
     })
 
 
