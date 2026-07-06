@@ -717,8 +717,8 @@ module "agent" {
     USING MODEL `fraud_model`
     USING PROMPT 'You are a real-time fraud detection analyst receiving activity profiles PRE-FILTERED by windowed ARIMA anomaly detection.
 
-    IMPORTANT: These profiles have already been flagged by a statistical ARIMA model that analyzes 15-second spending windows.
-    ARIMA detected that the user''s total spending in a 15-second window was anomalously high compared to their historical baseline.
+    IMPORTANT: These profiles have already been flagged by a statistical ARIMA model that analyzes 3-second spending windows.
+    ARIMA detected that the user''s total spending in a 3-second window was anomalously high compared to their historical baseline.
     Each transaction shows: [WINDOW ANOMALY: total=$X, expected=$Y] where total > expected indicates unusual spending velocity.
 
     Your job is CONTEXTUAL ANALYSIS. The ARIMA model only sees aggregate spending patterns — you see the full picture:

@@ -24,7 +24,7 @@ SR_URL = os.environ["SCHEMA_REGISTRY_URL"]
 SR_API_KEY = os.environ["SCHEMA_REGISTRY_API_KEY"]
 SR_API_SECRET = os.environ["SCHEMA_REGISTRY_API_SECRET"]
 
-TOPICS = ["transactions", "user_logins", "account_changes", "fraud_alerts", "anomalous_transactions"]
+TOPICS = ["transactions", "user_logins", "account_changes", "fraud_analysis_results", "user_activity_anomalous_enriched"]
 MAX_EVENTS = 500
 TIMESERIES_BUCKETS = 30
 BUCKET_SECONDS = 10
@@ -94,8 +94,8 @@ TOPIC_COLORS = {
     "transactions": "#4fc3f7",
     "user_logins": "#81c784",
     "account_changes": "#ffb74d",
-    "fraud_alerts": "#ef5350",
-    "anomalous_transactions": "#ff6f00",
+    "fraud_analysis_results": "#ef5350",
+    "user_activity_anomalous_enriched": "#ff6f00",
 }
 
 
@@ -115,7 +115,7 @@ def create_consumer():
 
 def create_avro_deserializer():
     """Generic Avro deserializer — resolves each message's writer schema from
-    Schema Registry by id, so one instance decodes all four topics."""
+    Schema Registry by id, so one instance decodes all five topics."""
     sr = SchemaRegistryClient({
         "url": SR_URL,
         "basic.auth.user.info": f"{SR_API_KEY}:{SR_API_SECRET}",
@@ -129,7 +129,7 @@ def get_bucket_key():
 
 
 def _coerce_list(value):
-    """fraud_alerts stores actions_taken / flagged_transaction_ids as JSON-array
+    """fraud_analysis_results stores actions_taken / flagged_transaction_ids as JSON-array
     strings; turn them back into Python lists for display."""
     if isinstance(value, list):
         return value
@@ -152,11 +152,13 @@ def process_message(topic, value, batch):
         summary = f"{value.get('location', '?')} via {value.get('device_id', '?')}"
     elif topic == "account_changes":
         summary = f"{value.get('field_changed', '?')}: {value.get('old_value', '?')} → {value.get('new_value', '?')}"
-    elif topic == "anomalous_transactions":
-        window_total = value.get('window_total_amount', 0)
+    elif topic == "user_activity_anomalous_enriched":
+        window_total = value.get('window_total', 0)
         expected = value.get('expected_amount', 0)
-        summary = f"${value.get('amount', 0):.2f} at {value.get('merchant', '?')} [Window total=${window_total:.2f}, expected=${expected:.2f}]"
-    elif topic == "fraud_alerts":
+        txn_count = value.get('txn_count', 0)
+        avg_amount = value.get('avg_amount', 0)
+        summary = f"{txn_count} txns, avg ${avg_amount:.2f} [Window total=${window_total:.2f}, expected=${expected:.2f}]"
+    elif topic == "fraud_analysis_results":
         value["actions_taken"] = _coerce_list(value.get("actions_taken"))
         value["flagged_transaction_ids"] = _coerce_list(value.get("flagged_transaction_ids"))
         summary = f"Risk {value.get('risk_score', '?')}: {str(value.get('reasoning', '?'))[:100]}"
@@ -210,7 +212,7 @@ def kafka_polling_thread(state, lock):
                         "summary": summary,
                     })
 
-                    if topic == "fraud_alerts":
+                    if topic == "fraud_analysis_results":
                         state["alerts"].appendleft({"time": ts, **value})
                         state["user_alert_counts"][user_id] = (
                             state["user_alert_counts"].get(user_id, 0) + 1
@@ -228,8 +230,8 @@ def kafka_polling_thread(state, lock):
                             "transactions": 0,
                             "user_logins": 0,
                             "account_changes": 0,
-                            "anomalous_transactions": 0,
-                            "fraud_alerts": 0,
+                            "user_activity_anomalous_enriched": 0,
+                            "fraud_analysis_results": 0,
                         })
                     ts_buckets[0][topic] = ts_buckets[0].get(topic, 0) + 1
     finally:
