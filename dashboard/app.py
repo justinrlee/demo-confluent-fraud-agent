@@ -204,7 +204,8 @@ def kafka_polling_thread(state, lock):
             with lock:
                 for topic, ts, user_id, summary, value in batch:
                     state["counters"][topic] = state["counters"].get(topic, 0) + 1
-                    state["users"].add(user_id)
+                    if user_id != "N/A":
+                        state["users"].add(user_id)
 
                     state["events"].appendleft({
                         "time": ts,
@@ -380,9 +381,9 @@ def render_charts(state):
 
     user_counts = state["user_alert_counts"]
     if user_counts:
-        st.caption("Alerts by User")
+        st.caption("Alerts by User (Top 5)")
         df = pd.DataFrame(
-            [{"User": u, "Alerts": c} for u, c in sorted(user_counts.items(), key=lambda x: -x[1])]
+            [{"User": u, "Alerts": c} for u, c in sorted(user_counts.items(), key=lambda x: -x[1])[:5]]
         )
         chart = (
             alt.Chart(df)

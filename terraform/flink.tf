@@ -269,7 +269,7 @@ module "insert_user_activity_scored" {
           JSON_OBJECT(
             'minTrainingSize' VALUE 50,
             'maxTrainingSize' VALUE 128,
-            'confidencePercentage' VALUE 99.5,
+            'confidencePercentage' VALUE 99.95,
             'enableStl' VALUE FALSE
           )
         ) OVER (
