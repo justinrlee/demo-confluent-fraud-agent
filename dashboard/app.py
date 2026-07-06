@@ -14,8 +14,9 @@ from confluent_kafka.schema_registry.avro import AvroDeserializer
 from confluent_kafka.serialization import MessageField, SerializationContext
 from dotenv import load_dotenv
 
-# Load Terraform-generated connection config.
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+# Load connection config: home directory defaults first, then project root (with precedence)
+load_dotenv(os.path.expanduser("~/.env"))  # Optional defaults, continues if missing
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)  # Project-specific overrides
 
 KAFKA_BOOTSTRAP = os.environ["BOOTSTRAP_SERVERS"]
 KAFKA_API_KEY = os.environ["KAFKA_API_KEY"]

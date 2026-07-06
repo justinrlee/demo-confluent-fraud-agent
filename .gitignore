@@ -40,3 +40,6 @@ dependency-reduced-pom.xml
 .vscode/
 .DS_Store
 Thumbs.db
+
+run/*.log
+run/*.pid

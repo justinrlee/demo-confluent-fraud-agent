@@ -267,7 +267,7 @@ module "insert_user_activity_scored" {
           `avg_amount`,
           `window_time`,
           JSON_OBJECT(
-            'minTrainingSize' VALUE 32,
+            'minTrainingSize' VALUE 50,
             'maxTrainingSize' VALUE 128,
             'confidencePercentage' VALUE 99.5,
             'enableStl' VALUE FALSE

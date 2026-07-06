@@ -24,8 +24,9 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-# Load Terraform-generated connection config
-load_dotenv(".env")
+# Load connection config: home directory defaults first, then project root (with precedence)
+load_dotenv(os.path.expanduser("~/.env"))  # Optional defaults, continues if missing
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)  # Project-specific overrides
 
 BOOTSTRAP = os.environ["BOOTSTRAP_SERVERS"]
 KAFKA_API_KEY = os.environ["KAFKA_API_KEY"]
