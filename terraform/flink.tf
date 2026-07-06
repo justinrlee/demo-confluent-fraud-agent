@@ -91,7 +91,7 @@ module "tbl_transactions" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
@@ -119,7 +119,7 @@ module "tbl_user_logins" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
@@ -147,7 +147,7 @@ module "tbl_account_changes" {
       `timestamp` BIGINT NOT NULL,
       `event_time` AS TO_TIMESTAMP_LTZ(`timestamp`, 3),
       WATERMARK FOR `event_time` AS `event_time` - INTERVAL '5' SECOND
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
@@ -185,7 +185,7 @@ module "tbl_user_activity_scored" {
       `lower_bound` DOUBLE,
       `is_anomaly` BOOLEAN,
       PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'changelog.mode' = 'append',
       'kafka.consumer.isolation-level' = 'read-uncommitted'
@@ -336,7 +336,7 @@ module "tbl_user_activity_anomalous" {
       `lower_bound` DOUBLE,
       `is_anomaly` BOOLEAN,
       PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'changelog.mode' = 'append',
       'kafka.consumer.isolation-level' = 'read-uncommitted'
@@ -394,7 +394,7 @@ module "tbl_user_activity_anomalous_enriched" {
       `lower_bound` DOUBLE,
       `enriched_profile_text` STRING,
       PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'changelog.mode' = 'append',
       'kafka.consumer.isolation-level' = 'read-uncommitted'
@@ -475,7 +475,7 @@ module "tbl_fraud_analysis_results" {
       `expected_amount` DOUBLE,
       `upper_bound` DOUBLE,
       `lower_bound` DOUBLE
-    ) DISTRIBUTED INTO 1 BUCKETS
+    ) DISTRIBUTED INTO 6 BUCKETS
     WITH (
       'kafka.consumer.isolation-level' = 'read-uncommitted'
     );
