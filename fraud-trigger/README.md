@@ -27,7 +27,7 @@ for the continuous producer's random cycles.
 | **Account Takeover** | 3 (2 account changes + transaction) | Email change → Password change → Large purchase | ~95 |
 | **Velocity** | 7 (login + 6 transactions) | 6 rapid transactions across different merchants | ~85 |
 
-All scenarios target **user-199** or **user-200** (the designated fraud_target users
+All scenarios target **user-49** or **user-50** (the designated fraud_target users
 with low baseline spending, making fraud highly anomalous).
 
 ---
@@ -134,7 +134,7 @@ while time.time() < end:
     m = c.poll(1.0)
     if m and not m.error():
         v = d(m.value(), SerializationContext(m.topic(), MessageField.VALUE))
-        if v["user_id"] in ["user-199", "user-200"]:
+        if v["user_id"] in ["user-49", "user-50"]:
             print(f"✓ Alert: {v['user_id']} | risk={v['risk_score']} | {v['reasoning'][:80]}")
 c.close()
 PY
@@ -160,7 +160,7 @@ Triggers a fraud scenario for a specific user.
 ```json
 {
   "scenario": "geo_impossible" | "account_takeover" | "velocity",
-  "user": "user-199" | "user-200"
+  "user": "user-49" | "user-50"
 }
 ```
 
@@ -170,7 +170,7 @@ Triggers a fraud scenario for a specific user.
   "status": "success",
   "events_sent": 2,
   "scenario": "geo_impossible",
-  "user": "user-199"
+  "user": "user-49"
 }
 ```
 
@@ -183,7 +183,7 @@ Triggers a fraud scenario for a specific user.
 ```bash
 curl -X POST http://localhost:8080/trigger \
   -H "Content-Type: application/json" \
-  -d '{"scenario":"velocity","user":"user-199"}'
+  -d '{"scenario":"velocity","user":"user-49"}'
 ```
 
 ---
@@ -377,7 +377,7 @@ Re-run `terraform apply` to regenerate credentials.
 - **No TLS:** HTTP only; add ALB or nginx for HTTPS
 - **No authentication:** Publicly accessible (fine for short demos)
 - **No rate limiting:** Trust users not to spam
-- **Hardcoded users:** Only user-199 and user-200 (matches fraud_target profile)
+- **Hardcoded users:** Only user-49 and user-50 (matches fraud_target profile)
 - **Session window timing:** Alerts appear 3–30s after click (depends on window firing)
 
 ---
