@@ -27,3 +27,13 @@ variable "aws_secret_access_key" {
   type        = string
   sensitive   = true
 }
+
+variable "identifier" {
+  description = "Environment identifier"
+  type        = string
+}
+
+variable "region" {
+  description = "AWS Region"
+  type        = string
+}

@@ -5,8 +5,8 @@ resource "random_id" "suffix" {
 locals {
   # --- Fixed configuration (not user-facing) ------------------------------
   cloud_provider = "AWS"
-  aws_region     = "us-east-1"
-  prefix         = "fraud-agent"
+  aws_region     = var.region
+  prefix         = "${var.identifier}-fraud-agent"
 
   # Bedrock Claude model. The model id is encoded in the connection endpoint
   # URL (Confluent Cloud Bedrock connections work this way). Change this single
