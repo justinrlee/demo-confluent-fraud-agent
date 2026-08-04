@@ -11,7 +11,7 @@ locals {
   # Bedrock Claude model. The model id is encoded in the connection endpoint
   # URL (Confluent Cloud Bedrock connections work this way). Change this single
   # line if your IAM user's account lacks access to this model / inference profile.
-  bedrock_model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+  bedrock_model_id = var.bedrock_model_id
   bedrock_endpoint = "https://bedrock-runtime.${local.aws_region}.amazonaws.com/model/${local.bedrock_model_id}/invoke"
 
   # Catalog/database that Flink statements run against.

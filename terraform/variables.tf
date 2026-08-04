@@ -37,3 +37,9 @@ variable "region" {
   description = "AWS Region"
   type        = string
 }
+
+variable "bedrock_model_id" {
+  description = "Bedrock Model ID"
+  type        = string
+  default = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+}
