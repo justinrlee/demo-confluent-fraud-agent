@@ -154,62 +154,72 @@ module "tbl_account_changes" {
   EOT
 }
 
-# Combined user activity with ARIMA scoring (in-flight windowing pattern)
-module "tbl_user_activity_scored" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "create-table-user-activity-scored-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    CREATE TABLE `user_activity_scored` (
-      `user_id` STRING NOT NULL,
-      `window_start` TIMESTAMP_LTZ(3) NOT NULL,
-      `window_end` TIMESTAMP_LTZ(3),
-      `window_time` TIMESTAMP_LTZ(3),
-      `txn_count` BIGINT,
-      `total_amount` DOUBLE,
-      `avg_amount` DOUBLE,
-      `max_amount` DOUBLE,
-      `login_count` BIGINT,
-      `account_change_count` BIGINT,
-      `profile_text` STRING,
-      `expected_amount` DOUBLE,
-      `upper_bound` DOUBLE,
-      `lower_bound` DOUBLE,
-      `is_anomaly` BOOLEAN,
-      PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 6 BUCKETS
-    WITH (
-      'changelog.mode' = 'append',
-      'kafka.consumer.isolation-level' = 'read-uncommitted'
-    );
-  EOT
-}
+# Materialized-table: a single declarative CTAS-style object owning both the table definition and the
+# continuous query, updatable in place (no `-replace` needed to change `query`).
+resource "confluent_flink_materialized_table" "user_activity_scored" {
+  organization {
+    id = local.flink_common.organization_id
+  }
+  environment {
+    id = local.flink_common.environment_id
+  }
+  compute_pool {
+    id = local.flink_common.compute_pool_id
+  }
+  principal {
+    id = local.flink_common.principal_id
+  }
+  rest_endpoint = local.flink_common.rest_endpoint
+  credentials {
+    key    = local.flink_common.flink_api_key
+    secret = local.flink_common.flink_api_secret
+  }
 
-module "insert_user_activity_scored" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  extra_properties = {
+  display_name = "user_activity_scored"
+  kafka_cluster {
+    id = confluent_kafka_cluster.standard.id
+  }
+
+  # Schema is left to be inferred from `query` rather than declared via a `columns` block.
+  # Provider 2.87.0's `columns_physical` only exposes `column_physical_type` as a flat SQL
+  # type string (e.g. "STRING NOT NULL"), but the materialized-tables REST API expects a
+  # structured type object (`{"type":"VARCHAR","nullable":false,"length":...}`); sending the
+  # flat string causes an unhandled 500 on create (confirmed by POSTing the exact request
+  # body Terraform logged, both with and without the `columns` block, directly against the
+  # Flink REST API). Confirmed as a provider bug, not a query issue: dropping `columns`
+  # succeeds and Confluent's inferred schema is actually tighter than the hand-written one
+  # (e.g. `profile_text`/`*_count` inferred NOT NULL, correctly, since COALESCE/COUNT never
+  # produce null here). Revisit adding an explicit schema once the provider supports it.
+
+  constraints {
+    name     = "user_activity_scored_pk"
+    type     = "PRIMARY_KEY"
+    columns  = ["user_id"]
+    enforced = false
+  }
+
+  distribution {
+    kind         = "HASH"
+    keys         = ["user_id"]
+    bucket_count = 6
+  }
+
+  table_options = {
+    "changelog.mode"                 = "append"
+    "kafka.consumer.isolation-level" = "read-uncommitted"
+  }
+
+  # Session-scoped (SQL SET) config, applied only at creation. Pins the idle-partition
+  # watermark timeout so the SESSION window below doesn't stall as the job ages (see
+  # AGENTS.md Gotchas: "Watermark idle-timeout is required for steady alerts"), and sets
+  # the catalog/database context so unqualified table names below resolve correctly.
+  session_options = {
+    "sql.current-catalog"          = local.flink_common.catalog
+    "sql.current-database"         = local.flink_common.database
     "sql.tables.scan.idle-timeout" = "5 s"
   }
-  statement_name = "insert-user-activity-scored-${random_id.suffix.hex}"
-  statement      = <<-EOT
-    INSERT INTO `user_activity_scored`
+
+  query = <<-EOT
     WITH `unified` AS (
       SELECT `user_id`, 'transaction' AS `event_type`, `event_time`,
              `amount`,
@@ -295,127 +305,125 @@ module "insert_user_activity_scored" {
       `anomaly_result`.`upper_bound`,
       `anomaly_result`.`lower_bound`,
       `anomaly_result`.`is_anomaly`
-    FROM `anomaly_detection`;
+    FROM `anomaly_detection`
   EOT
+
   depends_on = [
     module.tbl_transactions,
     module.tbl_user_logins,
     module.tbl_account_changes,
-    module.tbl_user_activity_scored,
   ]
 }
 
-# Filter to only anomalous user activity sessions
-module "tbl_user_activity_anomalous" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "create-table-anomalous-user-activity-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    CREATE TABLE `user_activity_anomalous` (
-      `user_id` STRING NOT NULL,
-      `window_start` TIMESTAMP_LTZ(3) NOT NULL,
-      `window_end` TIMESTAMP_LTZ(3),
-      `window_time` TIMESTAMP_LTZ(3),
-      `txn_count` BIGINT,
-      `total_amount` DOUBLE,
-      `avg_amount` DOUBLE,
-      `max_amount` DOUBLE,
-      `login_count` BIGINT,
-      `account_change_count` BIGINT,
-      `profile_text` STRING,
-      `expected_amount` DOUBLE,
-      `upper_bound` DOUBLE,
-      `lower_bound` DOUBLE,
-      `is_anomaly` BOOLEAN,
-      PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 6 BUCKETS
-    WITH (
-      'changelog.mode' = 'append',
-      'kafka.consumer.isolation-level' = 'read-uncommitted'
-    );
-  EOT
-}
+resource "confluent_flink_materialized_table" "user_activity_anomalous" {
+  organization {
+    id = local.flink_common.organization_id
+  }
+  environment {
+    id = local.flink_common.environment_id
+  }
+  compute_pool {
+    id = local.flink_common.compute_pool_id
+  }
+  principal {
+    id = local.flink_common.principal_id
+  }
+  rest_endpoint = local.flink_common.rest_endpoint
+  credentials {
+    key    = local.flink_common.flink_api_key
+    secret = local.flink_common.flink_api_secret
+  }
 
-module "insert_user_activity_anomalous" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "insert-anomalous-user-activity-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    INSERT INTO `user_activity_anomalous`
+  display_name = "user_activity_anomalous"
+  kafka_cluster {
+    id = confluent_kafka_cluster.standard.id
+  }
+
+  # No explicit `columns` block: provider 2.87.0's `columns_physical` sends a flat SQL type
+  # string where the REST API expects a structured type object, causing an unhandled 500 on
+  # create (confirmed empirically against pair #1 above). Schema is inferred from `query`.
+
+  constraints {
+    name     = "user_activity_anomalous_pk"
+    type     = "PRIMARY_KEY"
+    columns  = ["user_id"]
+    enforced = false
+  }
+
+  distribution {
+    kind         = "HASH"
+    keys         = ["user_id"]
+    bucket_count = 6
+  }
+
+  table_options = {
+    "changelog.mode"                 = "append"
+    "kafka.consumer.isolation-level" = "read-uncommitted"
+  }
+
+  session_options = {
+    "sql.current-catalog"  = local.flink_common.catalog
+    "sql.current-database" = local.flink_common.database
+  }
+
+  query = <<-EOT
     SELECT *
     FROM `user_activity_scored`
     WHERE `is_anomaly` = TRUE
-      AND `avg_amount` > `upper_bound`;
+      AND `avg_amount` > `upper_bound`
   EOT
-  depends_on = [module.insert_user_activity_scored, module.tbl_user_activity_anomalous]
+
+  depends_on = [confluent_flink_materialized_table.user_activity_scored]
 }
 
-# Enrich anomalous user activity with ARIMA context prepended to profile text
-module "tbl_user_activity_anomalous_enriched" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "create-table-anomalous-user-activity-enriched-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    CREATE TABLE `user_activity_anomalous_enriched` (
-      `user_id` STRING NOT NULL,
-      `profile_start` TIMESTAMP_LTZ(3) NOT NULL,
-      `arima_window_start` TIMESTAMP_LTZ(3) NOT NULL,
-      `profile_end` TIMESTAMP_LTZ(3),
-      `arima_window_end` TIMESTAMP_LTZ(3),
-      `txn_count` BIGINT,
-      `window_total` DOUBLE,
-      `avg_amount` DOUBLE,
-      `expected_amount` DOUBLE,
-      `upper_bound` DOUBLE,
-      `lower_bound` DOUBLE,
-      `enriched_profile_text` STRING,
-      PRIMARY KEY (`user_id`) NOT ENFORCED
-    ) DISTRIBUTED INTO 6 BUCKETS
-    WITH (
-      'changelog.mode' = 'append',
-      'kafka.consumer.isolation-level' = 'read-uncommitted'
-    );
-  EOT
-}
+resource "confluent_flink_materialized_table" "user_activity_anomalous_enriched" {
+  organization {
+    id = local.flink_common.organization_id
+  }
+  environment {
+    id = local.flink_common.environment_id
+  }
+  compute_pool {
+    id = local.flink_common.compute_pool_id
+  }
+  principal {
+    id = local.flink_common.principal_id
+  }
+  rest_endpoint = local.flink_common.rest_endpoint
+  credentials {
+    key    = local.flink_common.flink_api_key
+    secret = local.flink_common.flink_api_secret
+  }
 
-module "insert_user_activity_anomalous_enriched" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "insert-anomalous-user-activity-enriched-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    INSERT INTO `user_activity_anomalous_enriched`
+  display_name = "user_activity_anomalous_enriched"
+  kafka_cluster {
+    id = confluent_kafka_cluster.standard.id
+  }
+
+  constraints {
+    name     = "user_activity_anomalous_enriched_pk"
+    type     = "PRIMARY_KEY"
+    columns  = ["user_id"]
+    enforced = false
+  }
+
+  distribution {
+    kind         = "HASH"
+    keys         = ["user_id"]
+    bucket_count = 6
+  }
+
+  table_options = {
+    "changelog.mode"                 = "append"
+    "kafka.consumer.isolation-level" = "read-uncommitted"
+  }
+
+  session_options = {
+    "sql.current-catalog"  = local.flink_common.catalog
+    "sql.current-database" = local.flink_common.database
+  }
+
+  query = <<-EOT
     SELECT
       `user_id`,
       `window_start` AS `profile_start`,
@@ -437,66 +445,52 @@ module "insert_user_activity_anomalous_enriched" {
         ', threshold: $', CAST(`upper_bound` AS STRING), ')\n\n',
         `profile_text`
       ) AS `enriched_profile_text`
-    FROM `user_activity_anomalous`;
+    FROM `user_activity_anomalous`
   EOT
-  depends_on = [
-    module.insert_user_activity_anomalous,
-    module.tbl_user_activity_anomalous_enriched,
-  ]
+
+  depends_on = [confluent_flink_materialized_table.user_activity_anomalous]
 }
 
-# Fraud analysis results sink table
-module "tbl_fraud_analysis_results" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "create-table-fraud-analysis-results-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    CREATE TABLE `fraud_analysis_results` (
-      `user_id` STRING NOT NULL,
-      `risk_score` INT NOT NULL,
-      `reasoning` STRING NOT NULL,
-      `actions_taken` STRING NOT NULL,
-      `flagged_transaction_ids` STRING NOT NULL,
-      `raw_response` STRING NOT NULL,
-      `profile_start` TIMESTAMP_LTZ(3),
-      `profile_end` TIMESTAMP_LTZ(3),
-      `enriched_profile_text` STRING,
-      `arima_window_start` TIMESTAMP_LTZ(3),
-      `arima_window_end` TIMESTAMP_LTZ(3),
-      `window_total` DOUBLE,
-      `expected_amount` DOUBLE,
-      `upper_bound` DOUBLE,
-      `lower_bound` DOUBLE
-    ) DISTRIBUTED INTO 6 BUCKETS
-    WITH (
-      'kafka.consumer.isolation-level' = 'read-uncommitted'
-    );
-  EOT
-}
+# Fraud detection on anomalous user activity. Riskiest of the four conversions: the query
+# invokes the streaming agent via `LATERAL TABLE(AI_RUN_AGENT(...))`, a construct Confluent's
+# docs never explicitly confirm as supported inside a materialized table's query (their own
+# quickstart-streaming-agents examples only ever use it inside plain CREATE TABLE AS SELECT).
+# No `constraints`/`distribution` block, matching the original CREATE TABLE, which declared
+# no PRIMARY KEY and plain round-robin `DISTRIBUTED INTO 6 BUCKETS` (no HASH key to derive).
+resource "confluent_flink_materialized_table" "fraud_analysis_results" {
+  organization {
+    id = local.flink_common.organization_id
+  }
+  environment {
+    id = local.flink_common.environment_id
+  }
+  compute_pool {
+    id = local.flink_common.compute_pool_id
+  }
+  principal {
+    id = local.flink_common.principal_id
+  }
+  rest_endpoint = local.flink_common.rest_endpoint
+  credentials {
+    key    = local.flink_common.flink_api_key
+    secret = local.flink_common.flink_api_secret
+  }
 
-# Fraud detection on anomalous user activity
-module "detect_user_activity" {
-  source           = "./modules/flink-statement"
-  organization_id  = local.flink_common.organization_id
-  environment_id   = local.flink_common.environment_id
-  compute_pool_id  = local.flink_common.compute_pool_id
-  principal_id     = local.flink_common.principal_id
-  rest_endpoint    = local.flink_common.rest_endpoint
-  flink_api_key    = local.flink_common.flink_api_key
-  flink_api_secret = local.flink_common.flink_api_secret
-  catalog          = local.flink_common.catalog
-  database         = local.flink_common.database
-  statement_name   = "detect-fraud-user-activity-${random_id.suffix.hex}"
-  statement        = <<-EOT
-    INSERT INTO `fraud_analysis_results`
+  display_name = "fraud_analysis_results"
+  kafka_cluster {
+    id = confluent_kafka_cluster.standard.id
+  }
+
+  table_options = {
+    "kafka.consumer.isolation-level" = "read-uncommitted"
+  }
+
+  session_options = {
+    "sql.current-catalog"  = local.flink_common.catalog
+    "sql.current-database" = local.flink_common.database
+  }
+
+  query = <<-EOT
     WITH `scored` AS (
       SELECT
         p.`user_id`,
@@ -530,12 +524,12 @@ module "detect_user_activity" {
       `expected_amount`,
       `upper_bound`,
       `lower_bound`
-    FROM `scored`;
+    FROM `scored`
   EOT
+
   depends_on = [
     module.agent,
-    module.insert_user_activity_anomalous_enriched,
-    module.tbl_fraud_analysis_results,
+    confluent_flink_materialized_table.user_activity_anomalous_enriched,
   ]
 }
 

@@ -386,5 +386,5 @@ Re-run `terraform apply` to regenerate credentials.
 
 - **Continuous producer:** `producer/generate_events.py` (normal + fraud cycles)
 - **Dashboard:** `dashboard/app.py` (Streamlit visualization)
-- **CLAUDE.md:** Full repo guide (architecture, deployment, testing)
+- **AGENTS.md:** Full repo guide (architecture, deployment, testing)
 - **demo.md:** 15-min presenter walkthrough

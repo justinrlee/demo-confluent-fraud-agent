@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Guidance for working in this repository.
 
@@ -41,7 +41,8 @@ a node in Stream Lineage). All Flink/agent/model/tool SQL is defined inline in
 | `terraform/variables.tf` | The **4** required inputs (Confluent key/secret, AWS Bedrock IAM key/secret). |
 | `terraform/modules/flink-statement/` | Thin reusable wrapper around `confluent_flink_statement`. |
 | `tools-udf/` | Java UDF tools (`flag_transaction`, `freeze_account`, `notify_user`) + the committed `target/fraud-tools.jar`. |
-| `producer/generate_events.py` | Synthetic event generator (Avro + SASL_SSL). |
+| `producer/generate_events.py` | Synthetic event generator (Avro + SASL_SSL) for Confluent Cloud. |
+| `producer/generate_events_local.py` | **Work in progress.** Variant of the producer for a local/self-managed Kafka + Schema Registry (mTLS, env-configured topics, self-registering schema) instead of Confluent Cloud. Not wired into `.env`/Terraform and not a supported entry point yet. |
 | `dashboard/app.py` | Streamlit dashboard (Avro + SASL_SSL); Recent Fraud Alerts table shows severity/user/score/time/reasoning/**actions**. |
 | `agent/models.py` | Pydantic data-model reference only — not imported at runtime. |
 | `demo.md` | ~15-min presenter walkthrough (Stream Lineage → Flink job → dashboard); screenshots in `images/demo/`. Linked from the README. |

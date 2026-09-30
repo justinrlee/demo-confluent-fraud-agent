@@ -155,7 +155,8 @@ demo-confluent-fraud-agent/
 │   ├── variables.tf                 # The 4 required inputs
 │   └── modules/flink-statement/     # Reusable confluent_flink_statement wrapper
 ├── tools-udf/                       # Java UDF tools (flag/freeze/notify) + pre-built JAR
-├── producer/generate_events.py      # Synthetic event generator
+├── producer/generate_events.py      # Synthetic event generator (Confluent Cloud)
+├── producer/generate_events_local.py # WIP: variant for a local/self-managed Kafka cluster, not yet supported
 ├── dashboard/app.py                 # Streamlit real-time dashboard
 └── requirements.txt                 # Local app dependencies
 ```

@@ -25,8 +25,9 @@ SR_URL = os.environ["SCHEMA_REGISTRY_URL"]
 SR_API_KEY = os.environ["SCHEMA_REGISTRY_API_KEY"]
 SR_API_SECRET = os.environ["SCHEMA_REGISTRY_API_SECRET"]
 
-TOPICS = ["transactions", "user_logins", "account_changes", "fraud_analysis_results", "user_activity_anomalous_enriched"]
-MAX_EVENTS = 500
+TOPICS = ["transactions", "user_logins", "account_changes", "fraud_analysis_results", "user_activity_scored", "user_activity_anomalous_enriched", "user_activity_anomalous"]
+MAX_EVENTS = 10000
+MAX_ACTIVITY_EVENTS = 5000
 TIMESERIES_BUCKETS = 30
 BUCKET_SECONDS = 10
 
@@ -38,8 +39,12 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
-    [data-testid="stMainBlockContainer"] { padding-top: 2.5rem; }
-    [data-testid="stHeader"] { background: rgba(14, 17, 23, 0.95); }
+    [data-testid="stMainBlockContainer"] { padding-top: 0 !important; }
+    [data-testid="stHeader"] { display: none !important; }
+    header[data-testid="stHeader"] { display: none !important; }
+    [data-testid="stToolbar"] { display: none !important; }
+    .block-container { padding-top: 0 !important; }
+    div[data-testid="stVerticalBlock"] > div:first-child { padding-top: 0 !important; }
     div[data-testid="stMetric"] {
         background: #1a1a2e;
         border: 1px solid #2a2a4a;
@@ -96,6 +101,7 @@ TOPIC_COLORS = {
     "user_logins": "#81c784",
     "account_changes": "#ffb74d",
     "fraud_analysis_results": "#ef5350",
+    "user_activity_scored": "#ff6f00",
     "user_activity_anomalous_enriched": "#ff6f00",
 }
 
@@ -147,9 +153,15 @@ def _coerce_list(value):
     return []
 
 
-def process_message(topic, value, batch):
+def process_message(topic, value, batch, key=None):
     ts = datetime.now().strftime("%H:%M:%S")
-    user_id = value.get("user_id", "N/A")
+    
+    # Try to get user_id from key first, then fall back to value
+    user_id = "N/A"
+    if key and isinstance(key, dict):
+        user_id = key.get("user_id", "N/A")
+    if user_id == "N/A":
+        user_id = value.get("user_id", "N/A")
 
     if topic == "transactions":
         summary = f"${value.get('amount', 0):.2f} at {value.get('merchant', '?')} — {value.get('location', '?')}"
@@ -157,6 +169,19 @@ def process_message(topic, value, batch):
         summary = f"{value.get('location', '?')} via {value.get('device_id', '?')}"
     elif topic == "account_changes":
         summary = f"{value.get('field_changed', '?')}: {value.get('old_value', '?')} → {value.get('new_value', '?')}"
+    elif topic == "user_activity_scored":
+        txn_count = value.get('txn_count', 0)
+        total_amount = value.get('total_amount', 0)
+        is_anomaly = value.get('is_anomaly')
+        anomaly_status = "ANOMALY" if is_anomaly else "normal" if is_anomaly is not None else "pending"
+        summary = f"{txn_count} txns, ${total_amount:.2f} total [{anomaly_status}]"
+    elif topic == "user_activity_anomalous":
+        txn_count = value.get('txn_count', 0)
+        total_amount = value.get('total_amount', 0)
+        expected = value.get('expected_amount', 0)
+        upper_bound = value.get('upper_bound', 0)
+        lower_bound = value.get('lower_bound', 0)
+        summary = f"ANOMALY: {txn_count} txns, ${total_amount:.2f} (expected ${expected:.2f})"
     elif topic == "user_activity_anomalous_enriched":
         window_total = value.get('window_total', 0)
         expected = value.get('expected_amount', 0)
@@ -194,10 +219,19 @@ def kafka_polling_thread(state, lock):
                     value = deserialize(
                         msg.value(), SerializationContext(msg.topic(), MessageField.VALUE)
                     )
+                    # Deserialize key if present
+                    key = None
+                    if msg.key() is not None:
+                        try:
+                            key = deserialize(
+                                msg.key(), SerializationContext(msg.topic(), MessageField.KEY)
+                            )
+                        except Exception:
+                            pass  # Key deserialization failed, continue with None
                 except Exception:
                     continue
                 if value is not None:
-                    process_message(msg.topic(), value, batch)
+                    process_message(msg.topic(), value, batch, key)
 
             if not batch:
                 time.sleep(0.2)
@@ -211,13 +245,24 @@ def kafka_polling_thread(state, lock):
                     if user_id != "N/A":
                         state["users"].add(user_id)
 
-                    state["events"].appendleft({
-                        "time": ts,
-                        "topic": topic,
-                        "user_id": user_id,
-                        "summary": summary,
-                    })
+                    if topic in ["transactions", "user_logins", "account_changes"]:
+                        state["events"].appendleft({
+                            "time": ts,
+                            "topic": topic,
+                            "user_id": user_id,
+                            "summary": summary,
+                        })
 
+                    if topic == "user_activity_scored":
+                        state["scored_windows"].appendleft({"time": ts, "user_id": user_id, **value})
+                        # Check if ARIMA scoring is active (is_anomaly is not null)
+                        is_anomaly = value.get("is_anomaly")
+                        if is_anomaly is not None:
+                            state["arima_scoring_active"] = True
+                    
+                    if topic == "user_activity_anomalous":
+                        state["anomalous_activity"].appendleft({"time": ts, "user_id": user_id, **value})
+                    
                     if topic == "fraud_analysis_results":
                         state["alerts"].appendleft({"time": ts, **value})
 
@@ -269,12 +314,15 @@ def get_shared_state():
     if "initialized" not in st.session_state:
         st.session_state.state = {
             "events": deque(maxlen=MAX_EVENTS),
-            "alerts": deque(maxlen=100),
+            "alerts": deque(maxlen=MAX_ACTIVITY_EVENTS),
+            "anomalous_activity": deque(maxlen=MAX_ACTIVITY_EVENTS),
+            "scored_windows": deque(maxlen=MAX_ACTIVITY_EVENTS),
             "counters": {},
             "users": set(),
             "timeseries": deque(maxlen=TIMESERIES_BUCKETS),
-            "risk_history": deque(maxlen=200),
+            "risk_history": deque(maxlen=MAX_ACTIVITY_EVENTS),
             "user_alert_counts": {},
+            "arima_scoring_active": False,
         }
         st.session_state.lock = threading.Lock()
         t = threading.Thread(
@@ -332,41 +380,82 @@ def render_charts(state):
     chart_left, chart_right = st.columns(2)
 
     with chart_left:
-        st.caption("Events Over Time (by topic)")
-        ts_data = list(state["timeseries"])
-        if ts_data:
-            ts_data.reverse()
-            rows = []
-            for b in ts_data:
-                t = datetime.fromtimestamp(b["bucket"]).strftime("%H:%M:%S")
-                for topic in TOPICS:
-                    rows.append({
-                        "Time": t,
-                        "Topic": topic,
-                        "Count": b.get(topic, 0),
-                    })
-            df = pd.DataFrame(rows)
-            chart = (
-                alt.Chart(df)
-                .mark_area(opacity=0.7, interpolate="monotone")
-                .encode(
-                    x=alt.X("Time:N", title=None, axis=alt.Axis(labelAngle=-45, labelColor="#8888aa", gridColor="#2a2a4a")),
-                    y=alt.Y("Count:Q", stack=True, title="Events", axis=alt.Axis(labelColor="#8888aa", gridColor="#2a2a4a")),
-                    color=alt.Color(
-                        "Topic:N",
-                        scale=alt.Scale(
-                            domain=TOPICS,
-                            range=[TOPIC_COLORS[t] for t in TOPICS],
+        st.caption("Alerts by User (Top 5)")
+        user_counts = state["user_alert_counts"]
+        if user_counts:
+            # Sort users by severity priority: Critical desc, High desc, Medium desc, Low desc
+            sorted_users = sorted(
+                user_counts.items(),
+                key=lambda x: (x[1]["Critical"], x[1]["High"], x[1]["Medium"], x[1]["Low"]),
+                reverse=True
+            )[:5]
+
+            # Build DataFrame with one row per user-severity combination
+            data = []
+            user_order = []
+            for user_id, severity_counts in sorted_users:
+                total = sum(severity_counts.values())
+                user_label = f"{user_id} ({total})"
+                user_order.append(user_label)
+
+                for severity in ["Critical", "High", "Medium", "Low"]:
+                    count = severity_counts[severity]
+                    if count > 0:  # Only include non-zero severities
+                        data.append({
+                            "User": user_label,
+                            "Severity": severity,
+                            "Count": count,
+                            "UserID": user_id  # For tooltip
+                        })
+
+            if data:
+                df = pd.DataFrame(data)
+
+                # Define severity order and colors
+                severity_order = ["Critical", "High", "Medium", "Low"]
+                severity_colors = {
+                    "Critical": "#d32f2f",    # Dark red
+                    "High": "#f57c00",        # Orange
+                    "Medium": "#fbc02d",      # Yellow
+                    "Low": "#388e3c"          # Green
+                }
+
+                # Create stacked bar chart
+                chart = (
+                    alt.Chart(df)
+                    .mark_bar(cornerRadiusEnd=4, opacity=0.85)
+                    .encode(
+                        x=alt.X("Count:Q", title="Alert Count", axis=alt.Axis(labelColor="#8888aa", gridColor="#2a2a4a")),
+                        y=alt.Y(
+                            "User:N",
+                            sort=user_order,  # Maintain severity-based sort order
+                            title=None,
+                            axis=alt.Axis(labelColor="#c0c0e0")
                         ),
-                        legend=alt.Legend(orient="bottom", title=None, labelColor="#c0c0e0"),
-                    ),
-                    tooltip=["Time", "Topic", "Count"],
+                        color=alt.Color(
+                            "Severity:N",
+                            scale=alt.Scale(
+                                domain=severity_order,
+                                range=[severity_colors[s] for s in severity_order]
+                            ),
+                            legend=alt.Legend(title="Severity", orient="right")
+                        ),
+                        order=alt.Order("SeverityOrder:Q"),  # Stack in correct order
+                        tooltip=[
+                            alt.Tooltip("UserID:N", title="User"),
+                            alt.Tooltip("Severity:N", title="Severity"),
+                            alt.Tooltip("Count:Q", title="Count")
+                        ]
+                    )
+                    .transform_calculate(
+                        # Add numeric order for stacking (Critical=0, High=1, Medium=2, Low=3)
+                        SeverityOrder="{'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3}[datum.Severity]"
+                    )
+                    .properties(height=max(len(user_order) * 45, 120))
                 )
-                .properties(height=300)
-            )
-            st.altair_chart(chart.configure_view(stroke=None), width='stretch')
+                st.altair_chart(chart.configure_view(stroke=None), width='stretch')
         else:
-            st.info("Waiting for events...")
+            st.info("No fraud alerts yet...")
 
     with chart_right:
         st.caption("Fraud Alert Risk Scores")
@@ -404,86 +493,9 @@ def render_charts(state):
         else:
             st.info("Waiting for fraud alerts...")
 
-    user_counts = state["user_alert_counts"]
-    if user_counts:
-        st.caption("Alerts by User (Top 5)")
-
-        # Sort users by severity priority: Critical desc, High desc, Medium desc, Low desc
-        sorted_users = sorted(
-            user_counts.items(),
-            key=lambda x: (x[1]["Critical"], x[1]["High"], x[1]["Medium"], x[1]["Low"]),
-            reverse=True
-        )[:5]
-
-        # Build DataFrame with one row per user-severity combination
-        data = []
-        user_order = []
-        for user_id, severity_counts in sorted_users:
-            total = sum(severity_counts.values())
-            user_label = f"{user_id} ({total})"
-            user_order.append(user_label)
-
-            for severity in ["Critical", "High", "Medium", "Low"]:
-                count = severity_counts[severity]
-                if count > 0:  # Only include non-zero severities
-                    data.append({
-                        "User": user_label,
-                        "Severity": severity,
-                        "Count": count,
-                        "UserID": user_id  # For tooltip
-                    })
-
-        if data:
-            df = pd.DataFrame(data)
-
-            # Define severity order and colors
-            severity_order = ["Critical", "High", "Medium", "Low"]
-            severity_colors = {
-                "Critical": "#d32f2f",    # Dark red
-                "High": "#f57c00",        # Orange
-                "Medium": "#fbc02d",      # Yellow
-                "Low": "#388e3c"          # Green
-            }
-
-            # Create stacked bar chart
-            chart = (
-                alt.Chart(df)
-                .mark_bar(cornerRadiusEnd=4, opacity=0.85)
-                .encode(
-                    x=alt.X("Count:Q", title="Alert Count", axis=alt.Axis(labelColor="#8888aa", gridColor="#2a2a4a")),
-                    y=alt.Y(
-                        "User:N",
-                        sort=user_order,  # Maintain severity-based sort order
-                        title=None,
-                        axis=alt.Axis(labelColor="#c0c0e0")
-                    ),
-                    color=alt.Color(
-                        "Severity:N",
-                        scale=alt.Scale(
-                            domain=severity_order,
-                            range=[severity_colors[s] for s in severity_order]
-                        ),
-                        legend=alt.Legend(title="Severity", orient="right")
-                    ),
-                    order=alt.Order("SeverityOrder:Q"),  # Stack in correct order
-                    tooltip=[
-                        alt.Tooltip("UserID:N", title="User"),
-                        alt.Tooltip("Severity:N", title="Severity"),
-                        alt.Tooltip("Count:Q", title="Count")
-                    ]
-                )
-                .transform_calculate(
-                    # Add numeric order for stacking (Critical=0, High=1, Medium=2, Low=3)
-                    SeverityOrder="{'Critical': 0, 'High': 1, 'Medium': 2, 'Low': 3}[datum.Severity]"
-                )
-                .properties(height=max(len(user_order) * 45, 120))
-            )
-
-            st.altair_chart(chart.configure_view(stroke=None), width='stretch')
-
 
 def render_alerts_table(alerts_list):
-    st.markdown('<p class="section-header">Recent Fraud Alerts</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-header">Recent Fraud Analysis (fraud_analysis_results)</p>', unsafe_allow_html=True)
     if not alerts_list:
         st.info("No fraud alerts yet. Waiting for the Flink agent to produce alerts...")
         return
@@ -516,10 +528,139 @@ def render_alerts_table(alerts_list):
             st.markdown(f"`{actions}`")
 
 
-def render_event_feed(events_snapshot):
-    st.markdown('<p class="section-header">Live Event Feed</p>', unsafe_allow_html=True)
+def render_anomalous_activity(anomalous_list, user_filter=""):
+    st.markdown('<p class="section-header">Anomalous User Activity (user_activity_anomalous, filtered)</p>', unsafe_allow_html=True)
+    if not anomalous_list:
+        st.info("No anomalous activity detected yet...")
+        return
+
+    # Apply user filter if provided
+    if user_filter:
+        filtered = [a for a in anomalous_list if user_filter.lower() in a.get("user_id", "").lower()]
+    else:
+        filtered = anomalous_list
+    
+    # Return early if no matches after filtering
+    if not filtered:
+        st.info(f"No anomalous activity found for user filter: '{user_filter}'")
+        return
+
+    widths = [1, 1.3, 1, 1.5, 1.5, 1.8, 4]
+    header = st.columns(widths)
+    for col, title in zip(header, ["Time", "User", "Txns", "Total $", "Average $", "Average $ Range", "Details"]):
+        col.markdown(f"**{title}**")
+
+    for a in filtered[:15]:
+        user = a.get("user_id", "?")
+        txn_count = a.get("txn_count", 0)
+        total = a.get("total_amount", 0)
+        avg = a.get("avg_amount", 0)
+        lower = a.get("lower_bound")
+        upper = a.get("upper_bound")
+        if lower is not None and upper is not None:
+            range_str = f"${lower:.2f} - ${upper:.2f}"
+        else:
+            range_str = "—"
+        profile = a.get("profile_text", "")[:100]
+        alert_time = a.get("time", "")
+
+        cols = st.columns(widths)
+        with cols[0]:
+            st.markdown(f"`{alert_time}`")
+        with cols[1]:
+            st.markdown(f"**{user}**")
+        with cols[2]:
+            st.text(txn_count)
+        with cols[3]:
+            st.markdown(f"**${total:.2f}**")
+        with cols[4]:
+            st.text(f"${avg:.2f}")
+        with cols[5]:
+            st.text(range_str)
+        with cols[6]:
+            st.text(profile)
+
+
+def render_scored_windows(scored_list, user_filter=""):
+    st.markdown('<p class="section-header">Scored User Windows (user_activity_scored, filtered)</p>', unsafe_allow_html=True)
+    if not scored_list:
+        st.info("No scored windows yet...")
+        return
+
+    # Apply user filter if provided
+    if user_filter:
+        filtered = [s for s in scored_list if user_filter.lower() in s.get("user_id", "").lower()]
+    else:
+        filtered = scored_list
+    
+    # Return early if no matches after filtering
+    if not filtered:
+        st.info(f"No scored windows found for user filter: '{user_filter}'")
+        return
+
+    widths = [1, 1.3, 1, 1.5, 1.5, 1.8, 1.2, 4]
+    header = st.columns(widths)
+    for col, title in zip(header, ["Time", "User", "Txns", "Total $", "Average $", "Average $ Range", "Status", "Details"]):
+        col.markdown(f"**{title}**")
+
+    for s in filtered[:20]:
+        user = s.get("user_id", "?")
+        txn_count = s.get("txn_count", 0)
+        total = s.get("total_amount", 0)
+        avg = s.get("avg_amount", 0)
+        lower = s.get("lower_bound")
+        upper = s.get("upper_bound")
+        if lower is not None and upper is not None:
+            range_str = f"${lower:.2f} - ${upper:.2f}"
+        else:
+            range_str = "—"
+        is_anomaly = s.get("is_anomaly")
+        if is_anomaly is True:
+            status = "🔴 ANOMALY"
+        elif is_anomaly is False:
+            status = "🟢 Normal"
+        else:
+            status = "⏳ Pending"
+        profile = s.get("profile_text", "")[:100]
+        alert_time = s.get("time", "")
+
+        cols = st.columns(widths)
+        with cols[0]:
+            st.markdown(f"`{alert_time}`")
+        with cols[1]:
+            st.markdown(f"**{user}**")
+        with cols[2]:
+            st.text(txn_count)
+        with cols[3]:
+            st.text(f"${total:.2f}")
+        with cols[4]:
+            st.text(f"${avg:.2f}")
+        with cols[5]:
+            st.text(range_str)
+        with cols[6]:
+            st.markdown(status)
+        with cols[7]:
+            st.text(profile)
+
+
+def render_event_feed(events_snapshot, user_filter=""):
+    st.markdown('<p class="section-header">Live Event Feed (transactions, user_logins, account_changes)</p>', unsafe_allow_html=True)
+    
     if not events_snapshot:
         st.info("No events yet. Make sure the producer is running...")
+        return
+
+    # Filter to only show transactions, account_changes, user_logins
+    allowed_topics = ["transactions", "account_changes", "user_logins"]
+    filtered_events = [e for e in events_snapshot if e["topic"] in allowed_topics]
+
+    # Apply user filter if provided
+    if user_filter:
+        filtered_events = [e for e in filtered_events if user_filter.lower() in e["user_id"].lower()]
+    
+    # Return early if no matches after filtering
+    if not filtered_events:
+        st.info(f"No events found for user filter: '{user_filter}'")
         return
 
     header = st.columns([1, 1.5, 2, 6])
@@ -528,7 +669,7 @@ def render_event_feed(events_snapshot):
     header[2].markdown("**User**")
     header[3].markdown("**Details**")
 
-    for e in events_snapshot[:50]:
+    for e in filtered_events[:50]:
         topic = e["topic"]
         color = TOPIC_COLORS.get(topic, "#999")
         cols = st.columns([1, 1.5, 2, 6])
@@ -550,14 +691,29 @@ def main():
 
     state, lock = get_shared_state()
 
-    st.markdown("## :shield: Fraud Detection Dashboard v2 (Severity Breakdown)")
-    st.caption(f"Real-time monitoring · Kafka @ `{KAFKA_BOOTSTRAP}`")
+    # Header with ARIMA status and filter
+    title_col, status_col, filter_col = st.columns([2, 1.5, 1])
+    with title_col:
+        st.markdown("## :shield: Fraud Detection Dashboard v2")
+    with status_col:
+        with lock:
+            arima_active = state["arima_scoring_active"]
+        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+        if arima_active:
+            st.markdown('<span style="color: #4fc3f7; font-size: 0.85rem; font-weight: 600;">✓ ARIMA scoring active</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span style="color: #fbc02d; font-size: 0.85rem; font-weight: 600;">⏳ ARIMA scoring pending: not enough history</span>', unsafe_allow_html=True)
+    with filter_col:
+        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+        user_filter = st.text_input("Filter Events by User ID", value="", key="user_filter", label_visibility="collapsed", placeholder="Filter by User ID")
 
     with lock:
         snapshot = {
             "counters": dict(state["counters"]),
             "users": set(state["users"]),
             "alerts": list(state["alerts"]),
+            "anomalous_activity": list(state["anomalous_activity"]),
+            "scored_windows": list(state["scored_windows"]),
             "events": list(state["events"]),
             "timeseries": list(state["timeseries"]),
             "risk_history": list(state["risk_history"]),
@@ -573,7 +729,13 @@ def main():
     render_alerts_table(alerts_list)
 
     st.markdown("")
-    render_event_feed(snapshot["events"])
+    render_anomalous_activity(snapshot["anomalous_activity"], user_filter)
+
+    st.markdown("")
+    render_scored_windows(snapshot["scored_windows"], user_filter)
+
+    st.markdown("")
+    render_event_feed(snapshot["events"], user_filter)
 
     time.sleep(2)
     st.rerun()
