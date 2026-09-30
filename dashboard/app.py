@@ -30,6 +30,7 @@ MAX_EVENTS = 10000
 MAX_ACTIVITY_EVENTS = 5000
 TIMESERIES_BUCKETS = 30
 BUCKET_SECONDS = 10
+REFRESH_SECONDS = 2
 
 st.set_page_config(
     page_title="Fraud Detection Dashboard v2",
@@ -686,26 +687,24 @@ def render_event_feed(events_snapshot, user_filter=""):
             st.text(e["summary"])
 
 
-def main():
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+# The live panels refresh via fragments (run_every) rather than a `time.sleep(); st.rerun()`
+# loop. The frontend positions elements by index and only prunes leftovers from earlier runs
+# when a run finishes normally; a script that always ends in st.rerun() never does, so when
+# the user filter changed how many rows a section emitted, stale rows from the old layout
+# stayed on screen (duplicate feed panels, rows inheriting another table's extra columns).
+@st.fragment(run_every=REFRESH_SECONDS)
+def render_arima_status(state, lock):
+    with lock:
+        arima_active = state["arima_scoring_active"]
+    if arima_active:
+        st.markdown('<span style="color: #4fc3f7; font-size: 0.85rem; font-weight: 600;">✓ ARIMA scoring active</span>', unsafe_allow_html=True)
+    else:
+        st.markdown('<span style="color: #fbc02d; font-size: 0.85rem; font-weight: 600;">⏳ ARIMA scoring pending: not enough history</span>', unsafe_allow_html=True)
 
-    state, lock = get_shared_state()
 
-    # Header with ARIMA status and filter
-    title_col, status_col, filter_col = st.columns([2, 1.5, 1])
-    with title_col:
-        st.markdown("## :shield: Fraud Detection Dashboard v2")
-    with status_col:
-        with lock:
-            arima_active = state["arima_scoring_active"]
-        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
-        if arima_active:
-            st.markdown('<span style="color: #4fc3f7; font-size: 0.85rem; font-weight: 600;">✓ ARIMA scoring active</span>', unsafe_allow_html=True)
-        else:
-            st.markdown('<span style="color: #fbc02d; font-size: 0.85rem; font-weight: 600;">⏳ ARIMA scoring pending: not enough history</span>', unsafe_allow_html=True)
-    with filter_col:
-        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
-        user_filter = st.text_input("Filter Events by User ID", value="", key="user_filter", label_visibility="collapsed", placeholder="Filter by User ID")
+@st.fragment(run_every=REFRESH_SECONDS)
+def render_dashboard(state, lock):
+    user_filter = st.session_state.get("user_filter", "")
 
     with lock:
         snapshot = {
@@ -737,8 +736,24 @@ def main():
     st.markdown("")
     render_event_feed(snapshot["events"], user_filter)
 
-    time.sleep(2)
-    st.rerun()
+
+def main():
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+    state, lock = get_shared_state()
+
+    # Header with ARIMA status and filter
+    title_col, status_col, filter_col = st.columns([2, 1.5, 1])
+    with title_col:
+        st.markdown("## :shield: Fraud Detection Dashboard v2")
+    with status_col:
+        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+        render_arima_status(state, lock)
+    with filter_col:
+        st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
+        st.text_input("Filter Events by User ID", value="", key="user_filter", label_visibility="collapsed", placeholder="Filter by User ID")
+
+    render_dashboard(state, lock)
 
 
 if __name__ == "__main__":
