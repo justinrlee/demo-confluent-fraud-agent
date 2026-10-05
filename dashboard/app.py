@@ -94,6 +94,20 @@ CUSTOM_CSS = """
         display: inline-block; width: 10px; height: 10px;
         border-radius: 50%; margin-right: 6px;
     }
+    .action-chip {
+        display: inline-block; padding: 2px 8px; margin: 0 4px 2px 0;
+        border-radius: 4px; font-family: "Source Code Pro", monospace;
+        font-size: 0.8em; font-weight: 600; color: white;
+    }
+    .action-freeze_account { background: #d32f2f; }
+    .action-flag_transaction { background: #e65100; }
+    .action-notify_user { background: #0277bd; }
+    .action-other { background: #546e7a; }
+    .ts-highlight {
+        color: #ff9800; background: #1a1a2e; padding: 2px 6px;
+        border-radius: 4px; font-family: "Source Code Pro", monospace;
+        font-size: 0.85em;
+    }
 </style>
 """
 
@@ -347,6 +361,16 @@ def severity_label(score):
     return "low", "LOW"
 
 
+def actions_html(actions):
+    if not actions:
+        return "—"
+    known = {"freeze_account", "flag_transaction", "notify_user"}
+    return "".join(
+        f'<span class="action-chip action-{a if a in known else "other"}">{a}</span>'
+        for a in actions
+    )
+
+
 def render_metrics(state):
     txn = state["counters"].get("transactions", 0)
     login = state["counters"].get("user_logins", 0)
@@ -511,7 +535,7 @@ def render_alerts_table(alerts_list):
         cls, label = severity_label(score)
         user = a.get("user_id", "?")
         reasoning = a.get("reasoning", "")[:150]
-        actions = ", ".join(a.get("actions_taken", [])) or "—"
+        actions = actions_html(a.get("actions_taken", []))
         alert_time = a.get("time", "")
 
         cols = st.columns(widths)
@@ -522,11 +546,11 @@ def render_alerts_table(alerts_list):
         with cols[2]:
             st.markdown(f"Score: **{score}**")
         with cols[3]:
-            st.markdown(f"`{alert_time}`")
+            st.markdown(f'<span class="ts-highlight">{alert_time}</span>', unsafe_allow_html=True)
         with cols[4]:
             st.markdown(f"{reasoning}")
         with cols[5]:
-            st.markdown(f"`{actions}`")
+            st.markdown(actions, unsafe_allow_html=True)
 
 
 def render_anomalous_activity(anomalous_list, user_filter=""):
@@ -567,7 +591,7 @@ def render_anomalous_activity(anomalous_list, user_filter=""):
 
         cols = st.columns(widths)
         with cols[0]:
-            st.markdown(f"`{alert_time}`")
+            st.markdown(f'<span class="ts-highlight">{alert_time}</span>', unsafe_allow_html=True)
         with cols[1]:
             st.markdown(f"**{user}**")
         with cols[2]:
