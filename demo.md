@@ -8,9 +8,15 @@ A ~15-minute guided walkthrough to run **after deployment**. It follows the data
 
 ## Section 1 — The data sources: what's flowing in
 
-**1. Open Stream Lineage.** From your [Confluent Cloud cluster page](https://confluent.cloud/go/cluster), click on **Stream Lineage** for the cluster. You'll see the whole pipeline as a graph: the producer on the left, the three source topics, the chain of Flink materialized tables (`user_activity_scored` → `user_activity_anomalous` → `user_activity_anomalous_enriched`) in the middle, the `fraud_analysis_results` topic, and the dashboard consumer on the right. This one view *is* the architecture — live.
+**1. Open Stream Lineage.** From your [Confluent Cloud cluster page](https://confluent.cloud/go/cluster), click on **Stream Lineage** for the cluster. You'll see the whole pipeline as a graph: the producer feeding the three source topics, the chain of Flink materialized tables (`user_activity_scored` → `user_activity_anomalous` → `user_activity_anomalous_enriched`), the `fraud_analysis_results` topic, and the dashboard consumer. This one view *is* the architecture — live. The graph is wide, so it's shown here in two halves that overlap at `user_activity_anomalous`.
 
-![Stream Lineage — full pipeline overview](images/demo/01-stream-lineage-overview.png)
+**Part 1 — ingest, window and flag:** the three source topics are windowed and ARIMA-scored into `user_activity_scored`, and only the anomalous windows are kept in `user_activity_anomalous`.
+
+![Stream Lineage — source topics to user_activity_anomalous](images/demo/01a-lineage-ingest-scoring.png)
+
+**Part 2 — enrich, analyze and publish:** starting from `user_activity_anomalous`, the windows are enriched with ARIMA context, analyzed by the agent, and written to `fraud_analysis_results`, which the dashboard reads.
+
+![Stream Lineage — user_activity_anomalous to fraud_analysis_results](images/demo/01b-lineage-agent-verdicts.png)
 
 > [!NOTE]
 > The screenshots in this walkthrough were captured on an earlier version of the pipeline (a single `activity_profiles` topic feeding the agent, and a `fraud_alerts` topic). The flow is the same, but your lineage graph will show the four-table chain described here, with `fraud_analysis_results` as the final output.
@@ -43,7 +49,7 @@ A ~15-minute guided walkthrough to run **after deployment**. It follows the data
 
 ## Section 2 — The Flink pipeline: window, ARIMA, tools & the AI agent
 
-**6. Click the Flink materialized tables in Stream Lineage.** Four always-on Flink **materialized tables** do the work, and each appears in the graph as both a table and a topic:
+**6. Click the Flink statement nodes in Stream Lineage.** Four always-on Flink **materialized tables** do the work. Each owns a topic of the same name, and the continuous query that fills it shows up in the graph as a **Flink Statement** node between topics:
 
 - **`user_activity_scored`** reads the three source topics, windows them per user, and scores each window with ARIMA.
 - **`user_activity_anomalous`** keeps only the windows ARIMA flagged as unusually high spend.
@@ -51,6 +57,9 @@ A ~15-minute guided walkthrough to run **after deployment**. It follows the data
 - **`fraud_analysis_results`** runs the agent on each enriched profile and writes the verdict.
 
 So the flow is: sources → **user_activity_scored** → **user_activity_anomalous** → **user_activity_anomalous_enriched** → **fraud_analysis_results**.
+
+> [!NOTE]
+> Known issue: Stream Lineage doesn't currently render materialized tables as tables, so these queries appear as generically named Flink Statement nodes (`sys-lkc-…`) rather than by table name. Click a node to see its SQL and confirm which table it feeds.
 
 ![Flink job nodes in Stream Lineage](images/demo/06-flink-job-node.png)
 
@@ -129,7 +138,7 @@ This agent isn't a service you call on a schedule — it's **always on and event
 
 **13. Back in the [Stream Lineage UI](https://confluent.cloud/go/cluster), click on **Stream Lineage** and then click the `fraud_analysis_results` topic.** This is the agent's output stream — one verdict per anomalous user activity window. Show verdicts arriving in real time.
 
-![fraud_analysis_results topic — verdicts flowing](images/demo/13-fraud-alerts-topic.png)
+![fraud_analysis_results topic — verdicts flowing](images/demo/13-fraud_analysis_results-topic.png)
 
 **14. The verdicts are structured, queryable data.** In the Flink workspace, filter to the fraud the agent caught:
 
@@ -139,7 +148,7 @@ SELECT * FROM fraud_analysis_results WHERE risk_score >= 70;
 
 The key point here is *shape*: the agent's free-text answer has been parsed into typed columns — `user_id`, `risk_score`, `reasoning`, `actions_taken`, `flagged_transaction_ids` — so the verdict is queryable, joinable, and can drive downstream alerts. (We'll read the reasoning and see the action play out on the dashboard next.)
 
-![SELECT * FROM fraud_analysis_results — structured verdicts](images/demo/14-select-fraud-alerts.png)
+![SELECT * FROM fraud_analysis_results — structured verdicts](images/demo/14-select-fraud_analysis_results.png)
 
 
 **15. Open the Streamlit dashboard (`http://localhost:8501`).** Show the top-line metrics (events by type, anomalies, fraud alerts, high-risk count, unique users) and the activity/risk-score charts updating live. The header shows whether ARIMA scoring is active yet.

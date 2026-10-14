@@ -180,7 +180,7 @@ Directions:
         cd demo-confluent-fraud-agent
         ```
 
-    1. Copy the `.env` file to the base of the repo. It should look something like this:
+    1. Copy the `.env` file from the workstation used to provision the Confluent Cloud resources to the base of the repo on the cloud VM. It should look something like this:
 
         ```shell
         ubuntu@ip-10-32-1-20:~/demo-confluent-fraud-agent$ cat .env
